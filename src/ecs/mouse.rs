@@ -11,12 +11,13 @@ use tracing::{debug, trace, warn};
 use super::{MouseHeldMarker, Timeout};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
+use crate::ecs::overview::Overview;
 use crate::ecs::params::{GlobalState, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, DockPosition, MissionControlActive, Position, Scrolling,
     SpawnCommandsExt,
 };
-use bevy::ecs::schedule::common_conditions::on_message;
+use bevy::ecs::schedule::common_conditions::{not, on_message, resource_exists};
 
 use crate::events::{Event, InputEvent};
 use crate::manager::{Display, Origin, WindowManager, origin_from};
@@ -52,7 +53,10 @@ impl Plugin for MouseEventsPlugin {
                 mouse_up_trigger,
                 horizontal_warp_mouse_trigger,
             )
-                .run_if(on_message::<InputEvent>),
+                .run_if(on_message::<InputEvent>)
+                // The overview owns the pointer while it is up: hovering a
+                // tile must not focus-follow the real window underneath.
+                .run_if(not(resource_exists::<Overview>)),
         );
     }
 }

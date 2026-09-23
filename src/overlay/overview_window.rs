@@ -54,6 +54,7 @@ pub struct SceneTile {
     pub title: String,
     pub tab_count: usize,
     pub selected: bool,
+    pub hovered: bool,
 }
 
 fn ns_rect(rect: IRect) -> NSRect {
@@ -171,6 +172,8 @@ fn draw_tile(tile: &SceneTile, icon: Option<&NSImage>, origin: IVec2, progress: 
     path.fill();
     let (border, alpha, width) = if tile.selected {
         (SELECTED, progress, 3.0)
+    } else if tile.hovered {
+        (WHITE, 0.5 * progress, 2.0)
     } else {
         (WHITE, 0.18 * progress, 1.0)
     };

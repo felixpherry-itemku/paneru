@@ -384,7 +384,8 @@ impl InputHandler {
                 return self.handle_keypress(keycode, flags);
             }
             CGEventType::ScrollWheel => {
-                return self.handle_scroll_wheel(event);
+                // Nothing under the overview may scroll.
+                return OVERVIEW_ACTIVE.load(Ordering::Relaxed) || self.handle_scroll_wheel(event);
             }
             // Returns directly: handle_swipe returns bool (intercept flag)
             // rather than Result like the other arms.
@@ -398,8 +399,11 @@ impl InputHandler {
             // Trigger cleanup destructor, unregistering the handler.
             self.events = None;
         }
-        // Do not intercept this event, let it fall through.
-        false
+        // Clicks still reach the overview through the events sent above, but
+        // must not also land on the application window underneath it. Pointer
+        // motion falls through so the cursor keeps moving.
+        let is_click = !matches!(event_type, CGEventType::MouseMoved);
+        is_click && OVERVIEW_ACTIVE.load(Ordering::Relaxed)
     }
 
     /// Handles scroll wheel events. If configured modifier is held, it transforms the scroll into a swipe event.

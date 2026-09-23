@@ -1156,6 +1156,9 @@ pub(super) fn cleanup_on_exit(
     mut overlay_mgr: Option<NonSendMut<OverlayManager>>,
 ) {
     for _ in exit_events.read() {
+        // Hand the keyboard back first, in case the exit came mid-overview.
+        crate::platform::input::set_overview_active(false);
+
         let ids = all_windows.iter().map(|w| w.id()).collect::<Vec<_>>();
         info!("exit cleanup: restoring {} window(s)", ids.len());
         window_manager.dim_windows(&ids, 0.0);
