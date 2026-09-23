@@ -14,7 +14,7 @@ use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, BProcess, FocusedMarker, FreshMarker, MissionControlActive,
+    ActiveDisplayMarker, BProcess, FloatingFrame, FocusedMarker, FreshMarker, MissionControlActive,
     PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent, SystemTheme,
     Timeout, Unmanaged,
 };
@@ -562,6 +562,7 @@ pub(super) fn dispatch_application_messages(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_unmanaged_trigger(
     trigger: On<Add, Unmanaged>,
@@ -571,6 +572,7 @@ pub(super) fn window_unmanaged_trigger(
     // whole observer, but the strip removal below must still run without one.
     active_display: Option<ActiveDisplayViewport>,
     initializing: Option<Res<Initializing>>,
+    floating_frames: Query<&FloatingFrame>,
     mut focus_history: ResMut<FocusHistory>,
     mut ctx: WindowCtx,
 ) {
@@ -671,6 +673,26 @@ pub(super) fn window_unmanaged_trigger(
     // removal below still has to run.
     if parked_out_of_view {
         debug!("Entity {entity} is floating on a hidden virtual row, keeping its frame.");
+    } else if let Ok(saved) = floating_frames.get(entity) {
+        // The last floating frame wins over a `grid` rule, which only places
+        // the first float. Clamp the size first so the origin clamp can fit it.
+        let size = saved.size.min(display_bounds.size());
+        let origin = display_bounds.min
+            + Origin::new(
+                round_px(f64::from(display_bounds.width()) * saved.x),
+                round_px(f64::from(display_bounds.height()) * saved.y),
+            );
+        let target = clamp_origin_to_bounds(
+            IRect::from_corners(origin, origin + size),
+            size,
+            display_bounds,
+        );
+        if target.min != frame.min {
+            ctx.commands.reposition_entity(entity, target.min);
+        }
+        if target.size() != frame.size() {
+            ctx.commands.resize_entity(entity, target.size());
+        }
     } else if let Some((rx, ry, rw, rh)) = properties.grid_ratios() {
         let x = display_bounds.min.x + round_px(f64::from(display_bounds.width()) * rx);
         let y = display_bounds.min.y + round_px(f64::from(display_bounds.height()) * ry);
@@ -785,8 +807,26 @@ pub(super) fn window_managed_trigger(
     }
 
     debug!("Entity {entity} is managed again.");
+    // `On<Remove>` runs before the removal, so this is the variant going away.
+    let was_floating = matches!(
+        ctx.windows.get_managed(entity),
+        Some((_, _, Some(Unmanaged::Floating)))
+    );
     let (display, dock) = *active_display;
     let display_bounds = display.actual_display_bounds(dock, &ctx.config);
+    // Each tile-back overwrites it; the next float restores it.
+    if was_floating
+        && let Some(frame) = ctx.windows.frame(entity)
+        && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
+    {
+        entity_commands.try_insert(FloatingFrame {
+            x: f64::from(frame.min.x - display_bounds.min.x)
+                / f64::from(display_bounds.width().max(1)),
+            y: f64::from(frame.min.y - display_bounds.min.y)
+                / f64::from(display_bounds.height().max(1)),
+            size: frame.size(),
+        });
+    }
     let mut insert_at = previous_strips
         .get(entity)
         .ok()

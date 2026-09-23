@@ -361,6 +361,16 @@ pub struct PreviousManagedStrip {
     pub index: usize,
 }
 
+/// A window's last floating frame, saved when it tiles back (niri's
+/// `floating_pos` / `floating_window_size`). The position is a fraction of the
+/// display's working area so it carries across displays; the size is in pixels.
+#[derive(Clone, Component, Copy, Debug)]
+pub struct FloatingFrame {
+    pub x: f64,
+    pub y: f64,
+    pub size: Size,
+}
+
 /// Wrapper component for a `ProcessApi` trait object, enabling dynamic dispatch for process-related operations within Bevy.
 #[derive(Component, Deref, DerefMut)]
 pub struct BProcess(pub Box<dyn ProcessApi>);
