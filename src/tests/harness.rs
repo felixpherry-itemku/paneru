@@ -13,6 +13,7 @@ use crate::ecs::display::DisplayEventsPlugin;
 use crate::ecs::focus::FocusEventsPlugin;
 use crate::ecs::layout::LayoutEventsPlugin;
 use crate::ecs::mouse::MouseEventsPlugin;
+use crate::ecs::overview::OverviewPlugin;
 use crate::ecs::scroll::ScrollEventsPlugin;
 use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::WorkspaceEventsPlugin;
@@ -265,6 +266,7 @@ fn setup_world() -> App {
         .add_plugins(ScrollEventsPlugin)
         .add_plugins(WorkspaceEventsPlugin)
         .add_plugins(LayoutEventsPlugin)
+        .add_plugins(OverviewPlugin)
         .add_plugins(FocusEventsPlugin)
         .add_plugins(DisplayEventsPlugin)
         .add_plugins((register_triggers, register_systems, register_commands));

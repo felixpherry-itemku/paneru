@@ -197,6 +197,18 @@ pub enum Event {
     /// The system appearance (Light/Dark mode) has changed.
     ThemeChanged,
 
+    /// A key pressed while the overview is open. The event tap swallows every
+    /// key in that state and forwards it here instead of to any application.
+    OverviewKey { keycode: u8, modifiers: Modifiers },
+    /// A window thumbnail captured for the overview, as plain RGBA bytes so
+    /// nothing non-`Send` crosses the channel from the capture callback.
+    OverviewThumbnail {
+        window_id: WinID,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
+
     /// A command has been issued to the window manager.
     Command { command: Command },
 

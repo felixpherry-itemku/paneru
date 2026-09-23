@@ -713,6 +713,39 @@ impl Config {
             .unwrap_or(MissingWindowBehavior::Ignore)
     }
 
+    fn overview(&self) -> OverviewOptions {
+        self.inner().overview.clone().unwrap_or_default()
+    }
+
+    pub fn overview_animation_speed(&self) -> f64 {
+        self.overview()
+            .animation_speed
+            .map_or_else(|| self.animation_speed(), |speed| speed.max(0.0))
+    }
+
+    pub fn overview_scrim_opacity(&self) -> f32 {
+        self.overview()
+            .scrim_opacity
+            .unwrap_or(0.85)
+            .clamp(0.0, 1.0)
+    }
+
+    pub fn overview_scrim_color(&self) -> [f64; 3] {
+        self.overview().scrim_color.unwrap_or([0.05, 0.05, 0.07])
+    }
+
+    pub fn overview_row_gap(&self) -> i32 {
+        self.overview().row_gap.unwrap_or(24).max(0)
+    }
+
+    pub fn overview_label_height(&self) -> i32 {
+        self.overview().label_height.unwrap_or(20).max(0)
+    }
+
+    pub fn overview_thumbnails(&self) -> bool {
+        self.overview().thumbnails.unwrap_or(true)
+    }
+
     pub fn swipe_scroll_modifier(&self) -> Modifiers {
         let config = self.inner();
         config
@@ -1070,6 +1103,7 @@ struct InnerConfig {
     swipe: Option<swipe::SwipeOptions>,
     padding: Option<padding::PaddingOptions>,
     restore: Option<RestoreOptions>,
+    overview: Option<OverviewOptions>,
 }
 
 impl InnerConfig {
@@ -1162,6 +1196,25 @@ pub struct RestoreOptions {
     pub enabled: Option<bool>,
     pub startup_grace_ms: Option<u64>,
     pub missing_windows: Option<MissingWindowBehavior>,
+}
+
+/// The `[overview]` table. Every field is optional; the accessors on [`Config`]
+/// supply the defaults, so an absent table is valid.
+#[derive(Clone, Debug, Deserialize, Default)]
+pub struct OverviewOptions {
+    /// Ease-out decay rate for the open/close zoom. Falls back to
+    /// `options.animation_speed`.
+    pub animation_speed: Option<f64>,
+    /// Backdrop alpha once fully open.
+    pub scrim_opacity: Option<f32>,
+    /// Backdrop colour as `[r, g, b]` in `0.0..=1.0`.
+    pub scrim_color: Option<[f64; 3]>,
+    /// Vertical gap between row bands, in points.
+    pub row_gap: Option<i32>,
+    /// Space reserved at the top of each band for its row label, in points.
+    pub label_height: Option<i32>,
+    /// Master switch for window thumbnails (needs Screen Recording).
+    pub thumbnails: Option<bool>,
 }
 
 /// `MainOptions` represents the primary configuration options for the window manager.
@@ -2357,6 +2410,54 @@ missing_windows = "ignore"
         config.restore_missing_windows(),
         MissingWindowBehavior::Ignore
     );
+}
+
+#[test]
+fn test_overview_config_defaults() {
+    let config = Config::try_from(
+        r#"
+[options]
+animation_speed = 12.0
+
+[bindings]
+"#,
+    )
+    .expect("config should parse");
+
+    assert!((config.overview_animation_speed() - 12.0).abs() < f64::EPSILON);
+    assert!((config.overview_scrim_opacity() - 0.85).abs() < f32::EPSILON);
+    assert_eq!(config.overview_scrim_color(), [0.05, 0.05, 0.07]);
+    assert_eq!(config.overview_row_gap(), 24);
+    assert_eq!(config.overview_label_height(), 20);
+    assert!(config.overview_thumbnails());
+}
+
+#[test]
+fn test_overview_config_explicit_values() {
+    let config = Config::try_from(
+        r#"
+[options]
+animation_speed = 12.0
+
+[overview]
+animation_speed = 30.0
+scrim_opacity = 1.5
+scrim_color = [0.1, 0.2, 0.3]
+row_gap = 8
+label_height = 0
+thumbnails = false
+
+[bindings]
+"#,
+    )
+    .expect("config should parse");
+
+    assert!((config.overview_animation_speed() - 30.0).abs() < f64::EPSILON);
+    assert!((config.overview_scrim_opacity() - 1.0).abs() < f32::EPSILON);
+    assert_eq!(config.overview_scrim_color(), [0.1, 0.2, 0.3]);
+    assert_eq!(config.overview_row_gap(), 8);
+    assert_eq!(config.overview_label_height(), 0);
+    assert!(!config.overview_thumbnails());
 }
 
 #[test]

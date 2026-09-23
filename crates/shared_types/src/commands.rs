@@ -300,6 +300,9 @@ pub enum Command {
     /// A command to restart the window manager service.
     Restart,
     PrintState,
+    /// Toggles the overview: a zoomed-out map of every virtual workspace row on
+    /// the active display.
+    Overview,
     /// Invokes a Lua keybind handler by its registry id (see the daemon's
     /// `crate::lua`). Never produced by parsing; the runtime issues it directly.
     Lua(u32),

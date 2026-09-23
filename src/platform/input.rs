@@ -17,6 +17,7 @@ use std::ffi::c_void;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use stdext::function_name;
@@ -39,6 +40,16 @@ static FOCUSED_PASSTHROUGH: LazyLock<ArcSwap<Vec<(u8, Modifiers)>>> =
 /// key-down. Called from the ECS thread on focus change and config reload.
 pub fn set_focused_passthrough(keys: Vec<(u8, Modifiers)>) {
     FOCUSED_PASSTHROUGH.store(Arc::new(keys));
+}
+
+/// Whether the overview is open. While set, the event tap consumes every key
+/// and forwards it as [`Event::OverviewKey`] instead of matching keybindings.
+static OVERVIEW_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Switch the event tap in or out of overview mode. Every close path must clear
+/// it, or the keyboard stays swallowed.
+pub fn set_overview_active(active: bool) {
+    OVERVIEW_ACTIVE.store(active, Ordering::Relaxed);
 }
 
 /// How long to suppress scroll wheel events after a vertical swipe gesture,
@@ -566,6 +577,21 @@ impl InputHandler {
         };
 
         let mask = get_modifiers(eventflags);
+
+        // The overview is modal: every key goes to it and none reaches an
+        // application. Consumed even if the send fails — a partially swallowed
+        // keyboard is worse than a fully swallowed one, and Escape always closes.
+        if OVERVIEW_ACTIVE.load(Ordering::Relaxed) {
+            if let Ok(keycode) = u8::try_from(keycode) {
+                _ = events
+                    .send(Event::OverviewKey {
+                        keycode,
+                        modifiers: mask,
+                    })
+                    .inspect_err(|err| error!("Error sending overview key: {err}"));
+            }
+            return true;
+        }
 
         // On a native fullscreen space, keybindings are still intercepted so
         // that paneru can actively switch back to the previous workspace.
