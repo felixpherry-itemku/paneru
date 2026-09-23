@@ -708,7 +708,25 @@ fn handle_virtual_window_moves(
         }
         let follow = matches!(move_marker.move_focus, MoveFocus::Follow);
 
-        let target_idx = move_marker.target_virtual_index;
+        let mut target_idx = move_marker.target_virtual_index;
+        // With `dynamic_workspaces`, no move goes past the spare row. Capped
+        // here, against the rows as they are now, so every caller (Lua's
+        // `MoveToWorkspace` inserts the marker directly) gets the same cap.
+        if config.dynamic_workspaces() {
+            let mut occupancy = workspaces
+                .iter()
+                .filter(|(_, strip, ..)| strip.id() == workspace_id)
+                .map(|(_, strip, ..)| (strip.virtual_index, strip.len() > 0))
+                .collect::<Vec<_>>();
+            occupancy.sort_unstable();
+            target_idx = target_idx.min(spare_index(&occupancy));
+            if workspaces
+                .get(source_entity)
+                .is_ok_and(|(_, strip, ..)| strip.virtual_index == target_idx)
+            {
+                continue;
+            }
+        }
         let target = workspaces.iter().find_map(|(entity, strip, _, _, _)| {
             (strip.id() == workspace_id && strip.virtual_index == target_idx).then_some(entity)
         });
@@ -963,13 +981,49 @@ fn switch_virtual_workspace_bind(
     }
     rows.sort_by_key(|(_, strip, _)| strip.virtual_index);
 
+    // With `dynamic_workspaces`, numbered switches stop at the spare row and
+    // `VirtualAdd` is a switch to it, so no row is ever created past it.
+    let dynamic = config.dynamic_workspaces();
+    let occupancy = rows
+        .iter()
+        .map(|(_, strip, _)| (strip.virtual_index, strip.len() > 0))
+        .collect::<Vec<_>>();
+    let spare = spare_index(&occupancy);
+    // The number a row shows once the invariant has run: the target is the
+    // row on screen and the spare is last, so every row before the target
+    // survives iff it is occupied.
+    let label = |virtual_index: u32| {
+        if dynamic {
+            occupancy
+                .iter()
+                .filter(|&&(index, occupied)| occupied && index < virtual_index)
+                .count()
+                + 1
+        } else {
+            virtual_index as usize + 1
+        }
+    };
+    let capped;
+    let operation = match operation {
+        Operation::VirtualNumber(target_virtual_index) if dynamic => {
+            capped = Operation::VirtualNumber((*target_virtual_index).min(spare));
+            &capped
+        }
+        Operation::VirtualAdd if dynamic => {
+            capped = Operation::VirtualNumber(spare);
+            &capped
+        }
+        operation => operation,
+    };
+
     let current_index = rows.iter().position(|(_, _, active)| *active).unwrap_or(0);
     let next_index = match operation {
         Operation::Virtual(Direction::South | Direction::East) => {
             if current_index + 1 < rows.len() {
                 current_index + 1
             } else if active_display.active_strip().len() != 0
-                && config.create_workspace_automatically()
+                // Dynamic: only when the spare row hasn't been spawned yet.
+                && (config.create_workspace_automatically() || dynamic)
             {
                 let target_index = rows[current_index].1.virtual_index + 1;
                 commands.spawn_layout_strip(
@@ -979,7 +1033,7 @@ fn switch_virtual_workspace_bind(
                     true,
                 );
                 if config.workspace_popup_status() {
-                    commands.flash_message(format!("{}", target_index + 1), 1.0);
+                    commands.flash_message(format!("{}", label(target_index)), 1.0);
                 }
                 return;
             } else {
@@ -1002,7 +1056,7 @@ fn switch_virtual_workspace_bind(
                 );
 
                 if config.workspace_popup_status() {
-                    commands.flash_message(format!("{}", *target_virtual_index + 1), 1.0);
+                    commands.flash_message(format!("{}", label(*target_virtual_index)), 1.0);
                 }
                 return;
             };
@@ -1041,7 +1095,7 @@ fn switch_virtual_workspace_bind(
         entity_commands.try_insert(ActiveWorkspaceMarker);
 
         if config.workspace_popup_status() {
-            commands.flash_message(format!("{}", next_virtual_index + 1), 1.0);
+            commands.flash_message(format!("{}", label(next_virtual_index)), 1.0);
         }
     }
     debug!(
@@ -1055,7 +1109,9 @@ fn switch_virtual_workspace_bind(
 /// Handles the keybinding to move windows between virtual workspaces.
 /// Missing destinations are created by `handle_virtual_window_moves`. South at
 /// the last row only proceeds when `create_workspace_automatically` is on;
-/// numbered targets always may create, row 0 included.
+/// numbered targets always may create, row 0 included. With
+/// `dynamic_workspaces`, every target is capped at the spare row.
+#[allow(clippy::too_many_lines)]
 #[instrument(level = Level::DEBUG, skip_all)]
 fn move_virtual_workspace_bind(
     mut messages: MessageReader<Event>,
@@ -1126,6 +1182,22 @@ fn move_virtual_workspace_bind(
         _ => return,
     };
 
+    // With `dynamic_workspaces`, moves stop at the spare row like switches do.
+    let dynamic = config.dynamic_workspaces();
+    let target_virtual_index = if dynamic {
+        let occupancy = rows
+            .iter()
+            .map(|(_, strip, _)| (strip.virtual_index, strip.len() > 0))
+            .collect::<Vec<_>>();
+        let target = target_virtual_index.min(spare_index(&occupancy));
+        if target == current_virtual_index {
+            return;
+        }
+        target
+    } else {
+        target_virtual_index
+    };
+
     if let Ok(mut entity_commands) = commands.get_entity(focused_entity) {
         entity_commands.try_insert(VirtualMoveMarker {
             target_virtual_index,
@@ -1134,7 +1206,33 @@ fn move_virtual_workspace_bind(
     }
 
     if move_focus == MoveFocus::Follow && config.workspace_popup_status() {
-        commands.flash_message(format!("{}", target_virtual_index + 1), 1.0);
+        let label = if dynamic {
+            // The number the target shows once the invariant has run: the
+            // rows before it that stay occupied. The source only does if
+            // something is left behind once the moving tab group is gone.
+            let source = active_display.active_strip();
+            let moving = source
+                .tab_group(focused_entity)
+                .unwrap_or_else(|| vec![focused_entity]);
+            let source_keeps = source
+                .all_windows()
+                .iter()
+                .any(|entity| !moving.contains(entity));
+            rows.iter()
+                .filter(|(_, strip, active)| {
+                    strip.virtual_index < target_virtual_index
+                        && if *active {
+                            source_keeps
+                        } else {
+                            strip.len() > 0
+                        }
+                })
+                .count()
+                + 1
+        } else {
+            target_virtual_index as usize + 1
+        };
+        commands.flash_message(format!("{label}"), 1.0);
     }
 
     debug!("Moving {focused_entity} to new virtual space {target_virtual_index}");
@@ -1575,7 +1673,9 @@ mod tests {
 
     #[test]
     fn plan_dynamic_rows_cases() {
-        let cases: &[(&[(bool, bool)], &[usize], bool)] = &[
+        // `(occupied, shown)` rows, expected kept positions, expected spare.
+        type Case = (&'static [(bool, bool)], &'static [usize], bool);
+        let cases: &[Case] = &[
             // T-P1: a lone occupied row needs a spare.
             (&[(true, true)], &[0], true),
             // T-P2: case (a), on the empty row 2.
