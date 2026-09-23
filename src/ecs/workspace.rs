@@ -3,7 +3,7 @@ use bevy::ecs::change_detection::{DetectChanges as _, DetectChangesMut, Ref};
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::ChildOf;
-use bevy::ecs::lifecycle::Add;
+use bevy::ecs::lifecycle::{Add, RemovedComponents};
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With, Without};
@@ -11,7 +11,7 @@ use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res, ResMut, Single};
 use bevy::time::common_conditions::on_timer;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tracing::{Level, debug, error, instrument, warn};
 
@@ -25,8 +25,8 @@ use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER, origin_exposing};
 use crate::ecs::params::{ActiveDisplay, WindowCtx, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, DockPosition, FocusedMarker, Initializing, ManualStripOffset,
-    NativeFullscreenMarker, Position, RaiseWindow, RepositionMarker, Scrolling,
-    SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
+    NativeFullscreenMarker, Position, PreviousManagedStrip, RaiseWindow, RepositionMarker,
+    Scrolling, SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::errors::Result;
 use crate::events::{DestroySource, Event};
@@ -78,6 +78,24 @@ type RenumberStrips<'w, 's> = ParamSet<
     ),
 >;
 
+/// Every strip with what `maintain_dynamic_workspaces` needs: whether a
+/// display shows it (and whether that just changed), and whether its space is
+/// exempt (native fullscreen, or orphaned by a vanished display). One mutable
+/// query, since a separate `Changed<LayoutStrip>` query would alias it.
+type DynamicStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static mut LayoutStrip,
+        Option<Ref<'static, SelectedVirtualMarker>>,
+        Option<Ref<'static, ActiveWorkspaceMarker>>,
+        Option<Ref<'static, ChildOf>>,
+        Has<NativeFullscreenMarker>,
+        Has<Timeout>,
+    ),
+>;
+
 impl Plugin for WorkspaceEventsPlugin {
     fn build(&self, app: &mut App) {
         const DISPLAY_CHANGE_CHECK_FREQ: Duration = Duration::from_millis(1000);
@@ -87,6 +105,8 @@ impl Plugin for WorkspaceEventsPlugin {
                 config.reap_empty_workspaces() && !config.dynamic_workspaces()
             })
         };
+        let dynamic_workspaces =
+            |config: Option<Res<Config>>| config.is_some_and(|config| config.dynamic_workspaces());
 
         app.add_systems(
             PreUpdate,
@@ -97,6 +117,16 @@ impl Plugin for WorkspaceEventsPlugin {
             (
                 renumber_virtual_indexes,
                 reap_empty_virtual_workspaces.run_if(reap_workspaces),
+                // After everything that creates, fills or shows rows this
+                // tick, so it plans against the tick's final strips.
+                maintain_dynamic_workspaces
+                    .run_if(dynamic_workspaces)
+                    .run_if(not(resource_exists::<Initializing>))
+                    .after(renumber_virtual_indexes)
+                    .after(handle_virtual_window_moves)
+                    .after(show_active_workspace)
+                    .after(workspace_change_handler)
+                    .after(workspace_created_handler),
                 workspace_change_handler,
                 workspace_created_handler,
                 show_active_workspace,
@@ -1403,6 +1433,131 @@ fn reap_empty_virtual_workspaces(
             && let Ok(mut entity_commands) = commands.get_entity(entity)
         {
             entity_commands.try_despawn();
+        }
+    }
+}
+
+/// Keeps the `dynamic_workspaces` invariant on every space: a row without
+/// managed windows is removed once no display shows it, the survivors are
+/// numbered `0..N-1`, and exactly one empty spare row follows the last
+/// occupied one. Idles until a strip changes, is shown or is removed.
+#[instrument(level = Level::DEBUG, skip_all)]
+fn maintain_dynamic_workspaces(
+    mut removed: RemovedComponents<LayoutStrip>,
+    mut strips: DynamicStrips,
+    mut previous_managed: Query<(Entity, &mut PreviousManagedStrip)>,
+    displays: Query<(&Display, Option<&DockPosition>)>,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    let removed_any = removed.read().count() > 0;
+    // Only `DerefMut` marks a `Mut` changed, so this scan stays read-only.
+    let changed = strips
+        .iter_mut()
+        .any(|(_, strip, selected, active, child, _, _)| {
+            strip.is_changed()
+                || selected.is_some_and(|marker| marker.is_added())
+                || active.is_some_and(|marker| marker.is_added())
+                || child.is_some_and(|child| child.is_changed())
+        });
+    if !changed && !removed_any {
+        return;
+    }
+
+    let spaces = strips
+        .iter()
+        .map(|(_, strip, ..)| strip.id())
+        .collect::<HashSet<_>>();
+    for workspace_id in spaces {
+        let mut rows = strips
+            .iter_mut()
+            .filter(|(_, strip, ..)| strip.id() == workspace_id)
+            .collect::<Vec<_>>();
+        // A native fullscreen space holds one window and never gets a spare;
+        // an orphan waits for `find_orphaned_workspaces` to re-parent it.
+        let exempt = rows
+            .iter()
+            .any(|(_, strip, _, _, child, fullscreen, orphan)| {
+                *fullscreen || *orphan || child.is_none() || strip.is_fullscreen()
+            });
+        if exempt {
+            continue;
+        }
+        rows.sort_by_key(|(_, strip, ..)| strip.virtual_index);
+
+        let states = rows
+            .iter()
+            .map(|(_, strip, selected, active, ..)| RowState {
+                occupied: strip.len() > 0,
+                shown: selected.is_some() || active.is_some(),
+            })
+            .collect::<Vec<_>>();
+        let (keep, add_spare) = plan_dynamic_rows(&states);
+
+        // Old index to new one (`None`: removed), for the rows that change.
+        let mut remap = HashMap::new();
+        let mut rank = 0;
+        for (position, (entity, strip, ..)) in rows.iter_mut().enumerate() {
+            let old = strip.virtual_index;
+            if keep.contains(&position) {
+                // Written only when it differs, so the system goes idle again.
+                if old != rank {
+                    strip.virtual_index = rank;
+                    remap.insert(old, Some(rank));
+                }
+                rank += 1;
+            } else {
+                debug!("removing empty virtual workspace {old} on space {workspace_id}");
+                remap.insert(old, None);
+                if let Ok(mut entity_commands) = commands.get_entity(*entity) {
+                    entity_commands.try_despawn();
+                }
+            }
+        }
+
+        // A floated window returns to the row it remembers by index. Follow
+        // the renumbering; if its row is gone, forget it so the window lands
+        // in the active row rather than whichever row took the number.
+        if !remap.is_empty() {
+            for (entity, mut previous) in &mut previous_managed {
+                if previous.workspace_id != workspace_id {
+                    continue;
+                }
+                match remap.get(&previous.virtual_index) {
+                    Some(Some(new)) => previous.virtual_index = *new,
+                    Some(None) => {
+                        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                            entity_commands.try_remove::<PreviousManagedStrip>();
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+
+        let display_entity = rows
+            .iter()
+            .find(|(_, _, selected, active, ..)| selected.is_some() || active.is_some())
+            .or(rows.first())
+            .and_then(|(_, _, _, _, child, ..)| child.as_ref().map(|child| child.parent()));
+        if add_spare
+            && let Some(display_entity) = display_entity
+            && let Ok((display, dock)) = displays.get(display_entity)
+        {
+            debug!("adding spare virtual workspace {rank} on space {workspace_id}");
+            // Not `spawn_layout_strip`: its `SelectedVirtualMarker` would take
+            // "shown" from the row on screen. Parked like any hidden row, with
+            // the origin `show_active_workspace` restores it to.
+            let viewport = display.actual_display_bounds(dock, &config);
+            commands.spawn((
+                LayoutStrip::new(workspace_id, rank),
+                Position(display.bounds().max - PARKED_STRIP_SLIVER),
+                ChildOf(display_entity),
+                PreviousStripPosition {
+                    origin: viewport.min,
+                    focus: None,
+                },
+            ));
         }
     }
 }
