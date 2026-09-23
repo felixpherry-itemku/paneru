@@ -280,26 +280,32 @@ no default binding.
 overview = "alt - tab"
 ```
 
-While the overview is open it takes the whole keyboard, and nothing moves until
-you commit:
+The selection is the real focus: moves happen on the live layout behind the
+overview, and it follows them. While it is open:
 
 | Key | Effect |
 | :--- | :--- |
-| Arrow keys | Move the selection |
-| Your `window_focus_*` / `window_virtualfocus_*` bindings | Move the selection, exactly as they move focus outside the overview |
-| `Return` / keypad `Enter` | Focus the selected window (switching workspace if needed) and close |
-| `Escape`, or the `overview` binding again | Close, leaving focus and layout untouched |
+| Arrow keys | Move focus: ←/→ between columns, ↑/↓ within a stack, then to the workspace above/below |
+| Any Paneru binding | Runs as usual on the focused window; the overview follows |
+| `Return` / keypad `Enter` / `Escape` / the `overview` binding | Close, leaving focus where it is |
+| Other ⌘/⌥/⌃ chords | Pass through to macOS and other apps |
+| Plain typing | Swallowed |
 
-Clicking a tile focuses that window; clicking anywhere else closes the overview.
-It will not open while Mission Control is showing.
+Clicking a tile focuses that window (switching workspace if needed) and closes;
+clicking anywhere else closes. A click on something drawn above the overview,
+such as a screenshot selection, goes to that instead. The overview closes if
+the active display changes, and will not open while Mission Control is showing.
+
+The backdrop is the display's desktop picture (or a solid `scrim_color` when
+there is no still image), dimmed by `scrim_opacity`, so no window shows through.
 
 The optional `[overview]` table tunes it:
 
 ```toml
 [overview]
 animation_speed = 14.0         # zoom speed; defaults to options.animation_speed
-scrim_opacity = 0.85           # backdrop opacity once fully open (0.0 - 1.0)
-scrim_color = [0.05, 0.05, 0.07]
+scrim_opacity = 0.3            # dims the wallpaper behind the rows (0.0 - 1.0)
+scrim_color = [0.05, 0.05, 0.07] # dim colour; the backdrop if there's no wallpaper
 row_gap = 24                   # points between workspace bands
 label_height = 20              # points reserved for each band's number
 thumbnails = true              # capture window thumbnails (see below)
