@@ -1086,6 +1086,215 @@ fn test_unfloat_after_virtual_switch_uses_active_workspace() {
         .run(commands);
 }
 
+fn manage() -> Event {
+    Event::Command {
+        command: Command::Window(Operation::Manage),
+    }
+}
+
+fn settle() -> Event {
+    Event::Command {
+        command: Command::PrintState,
+    }
+}
+
+fn window_size(world: &mut World, id: WinID) -> Size {
+    let mut query = world.query::<&Window>();
+    query
+        .iter(world)
+        .find(|window| window.id() == id)
+        .expect("window not found")
+        .frame()
+        .size()
+}
+
+/// The window ids of the active row's columns, left to right.
+fn active_columns(world: &mut World) -> Vec<WinID> {
+    let columns = {
+        let mut query = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
+        query.single(world).expect("an active strip").all_columns()
+    };
+    columns
+        .into_iter()
+        .map(|entity| entity_to_window_id(world, entity))
+        .collect()
+}
+
+/// niri: floating the active column activates the column that slides into its
+/// index, and tiling back inserts right of that — so the first round trip
+/// shifts the window one column right.
+#[test]
+fn float_round_trip_tiles_back_right_of_the_active_column() {
+    let commands = vec![settle(), settle(), manage(), manage()];
+
+    TestHarness::new()
+        .with_windows(5)
+        .on_iteration(0, |_world, state| state.focus_window(1))
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 1);
+            assert_eq!(active_columns(world), vec![0, 1, 2, 3, 4]);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_eq!(active_columns(world), vec![0, 2, 3, 4]);
+        })
+        .on_iteration(3, |world, _state| {
+            assert_eq!(active_columns(world), vec![0, 2, 1, 3, 4]);
+        })
+        .run(commands);
+}
+
+/// niri's `activate_prev_column_on_removal`: a window that was just tiled back
+/// hands the active column back to its left neighbour when it floats again, so
+/// toggling after the first round trip doesn't move it.
+#[test]
+fn repeated_float_round_trips_keep_the_window_in_place() {
+    let commands = vec![settle(), settle(), manage(), manage(), manage(), manage()];
+
+    TestHarness::new()
+        .with_windows(5)
+        .on_iteration(0, |_world, state| state.focus_window(1))
+        .on_iteration(3, |world, _state| {
+            assert_eq!(active_columns(world), vec![0, 2, 1, 3, 4]);
+        })
+        .on_iteration(5, |world, _state| {
+            assert_focused!(world, 1);
+            assert_eq!(active_columns(world), vec![0, 2, 1, 3, 4]);
+        })
+        .run(commands);
+}
+
+/// Floating the last column hands the active column to the new last one, so
+/// tiling back lands where it started.
+#[test]
+fn float_round_trip_of_the_last_column_keeps_the_order() {
+    let commands = vec![settle(), settle(), manage(), manage()];
+
+    TestHarness::new()
+        .with_windows(5)
+        .on_iteration(0, |_world, state| state.focus_window(4))
+        .on_iteration(1, |world, _state| assert_focused!(world, 4))
+        .on_iteration(3, |world, _state| {
+            assert_eq!(active_columns(world), vec![0, 1, 2, 3, 4]);
+        })
+        .run(commands);
+}
+
+/// Focusing a tiled window while the float is out makes it the active column;
+/// focusing the float again leaves it so, and the float tiles back beside it.
+#[test]
+fn float_tiles_back_right_of_the_last_focused_tiled_window() {
+    let commands = vec![settle(), settle(), manage(), settle(), settle(), manage()];
+
+    TestHarness::new()
+        .with_windows(5)
+        .on_iteration(0, |_world, state| state.focus_window(1))
+        .on_iteration(2, |_world, state| state.focus_window(3))
+        .on_iteration(3, |world, state| {
+            assert_focused!(world, 3);
+            state.focus_window(1);
+        })
+        .on_iteration(4, |world, _state| assert_focused!(world, 1))
+        .on_iteration(5, |world, _state| {
+            assert_eq!(active_columns(world), vec![0, 2, 3, 1, 4]);
+        })
+        .run(commands);
+}
+
+/// Where the float sits on screen doesn't matter: it tiles back right of the
+/// active column, not at the end the old centre-overlap guess picked.
+#[test]
+fn float_moved_to_the_right_tiles_back_right_of_the_active_column() {
+    let commands = vec![settle(), settle(), manage(), settle(), manage()];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |_world, state| state.focus_window(0))
+        .on_iteration(1, |world, _state| assert_focused!(world, 0))
+        .on_iteration(2, |_world, state| {
+            state.os_move_window(0, Origin::new(700, TEST_MENUBAR_HEIGHT));
+        })
+        .on_iteration(3, |world, _state| assert_eq!(window_x(world, 0), 700))
+        .on_iteration(4, |world, _state| {
+            assert_eq!(active_columns(world), vec![1, 0, 2]);
+        })
+        .run(commands);
+}
+
+/// A window floats again at the size and position it last floated at.
+#[test]
+fn floating_again_restores_the_last_floating_frame() {
+    let commands = vec![settle(), settle(), manage(), settle(), manage(), manage()];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |_world, state| state.focus_window(0))
+        .on_iteration(2, |_world, state| {
+            state.os_move_window(0, Origin::new(300, 100));
+            state.os_resize_window(0, Size::new(500, 400));
+        })
+        .on_iteration(3, |world, _state| {
+            assert_window_at!(world, 0, 300, 100);
+            assert_window_size!(world, 0, 500, 400);
+        })
+        .on_iteration(4, |world, _state| {
+            assert_ne!(window_size(world, 0), Size::new(500, 400), "tiled");
+        })
+        .on_iteration(5, |world, _state| {
+            assert_window_at!(world, 0, 300, 100);
+            assert_window_size!(world, 0, 500, 400);
+        })
+        .run(commands);
+}
+
+/// A `grid` rule places only the first float; afterwards the window remembers
+/// where it last floated, like niri's `default-floating-position`.
+#[test]
+fn saved_floating_frame_wins_over_a_grid_rule() {
+    // Top-left quarter of the 1024x748 working area.
+    let (grid_width, grid_height) = (512, 374);
+    let mut params = WindowParams::new(".*", None);
+    params.grid = Some("2:2:0:0:1:1".to_string());
+    let config: Config = (MainOptions::default(), vec![params]).into();
+    let commands = vec![settle(), settle(), manage(), settle(), manage(), manage()];
+
+    TestHarness::new()
+        .with_config(config)
+        .with_windows(3)
+        .on_iteration(0, |_world, state| state.focus_window(0))
+        .on_iteration(2, move |world, state| {
+            assert_window_at!(world, 0, 0, TEST_MENUBAR_HEIGHT);
+            assert_window_size!(world, 0, grid_width, grid_height);
+            state.os_move_window(0, Origin::new(300, 100));
+        })
+        .on_iteration(3, |world, _state| assert_window_at!(world, 0, 300, 100))
+        .on_iteration(5, move |world, _state| {
+            assert_window_at!(world, 0, 300, 100);
+            assert_window_size!(world, 0, grid_width, grid_height);
+        })
+        .run(commands);
+}
+
+/// A saved frame hanging off the display comes back fully on screen: paneru
+/// counts a mostly off-screen window as hidden.
+#[test]
+fn restored_floating_frame_is_clamped_on_screen() {
+    let commands = vec![settle(), settle(), manage(), settle(), manage(), manage()];
+
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(0, |_world, state| state.focus_window(0))
+        .on_iteration(2, |_world, state| {
+            state.os_move_window(0, Origin::new(900, 100));
+        })
+        .on_iteration(3, |world, _state| assert_eq!(window_x(world, 0), 900))
+        .on_iteration(5, |world, _state| {
+            let width = window_size(world, 0).x;
+            assert_eq!(width, TEST_WINDOW_WIDTH);
+            assert_window_at!(world, 0, TEST_DISPLAY_WIDTH - width, 100);
+        })
+        .run(commands);
+}
+
 #[test]
 fn focus_unmanaged_ignores_floats_from_other_workspaces() {
     let workspaces = vec![TEST_WORKSPACE_ID, TEST_WORKSPACE_ID + 1];
