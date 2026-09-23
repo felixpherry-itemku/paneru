@@ -699,6 +699,55 @@ fn test_startup_restore_keeps_emptied_baseline_row() {
     );
 }
 
+/// With `dynamic_workspaces`, the first pass after startup compacts the
+/// restored rows: gaps close, saved empty rows go, and exactly one spare
+/// follows the last occupied row.
+#[test]
+fn test_startup_restore_compacts_rows_with_dynamic_workspaces() {
+    let config: Config = (
+        MainOptions {
+            dynamic_workspaces: Some(true),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let state = state_with_strips(vec![
+        SavedStrip {
+            virtual_index: 0,
+            columns: vec![SavedColumn::Single(saved_window(0))],
+        },
+        SavedStrip {
+            virtual_index: 4,
+            columns: vec![SavedColumn::Single(saved_window(1))],
+        },
+        SavedStrip {
+            virtual_index: 6,
+            columns: vec![],
+        },
+        SavedStrip {
+            virtual_index: 8,
+            columns: vec![],
+        },
+    ]);
+    let mut harness = TestHarness::new()
+        .with_config(config)
+        .with_windows(2)
+        .with_state(state);
+    harness.advance(Duration::from_secs(1));
+
+    let world = harness.world();
+    let mut query = world.query::<(&LayoutStrip, Has<crate::ecs::ActiveWorkspaceMarker>)>();
+    let mut rows = query
+        .iter(world)
+        .filter(|(strip, _)| strip.id() == TEST_WORKSPACE_ID)
+        .map(|(strip, active)| (strip.virtual_index, strip.len(), active))
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+
+    assert_eq!(rows, vec![(0, 1, true), (1, 1, false), (2, 0, false)]);
+}
+
 fn saved_display(display_id: u32, active: bool) -> SavedDisplay {
     SavedDisplay {
         display_id,

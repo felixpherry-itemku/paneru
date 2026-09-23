@@ -5,3 +5,5 @@
 **Overview backdrop.** The overview draws an opaque backdrop — the display's desktop wallpaper, else the scrim colour — so no application window shows through it.
 
 **Screen capture.** Overview tiles carry window thumbnails captured through ScreenCaptureKit on macOS 14 and later, which requires the Screen Recording permission. This is the only feature in Paneru that needs a permission beyond Accessibility; when it is unavailable, tiles fall back to the application icon and window title and nothing else degrades.
+
+**Dynamic workspaces.** With `dynamic_workspaces` enabled, each macOS Space numbers its virtual workspaces 1..N without gaps: a workspace with no managed windows is removed as soon as no display is showing it, and exactly one empty workspace always follows the last occupied one. Switches and moves by number, `last` or southward never go past that trailing workspace. Native fullscreen Spaces are exempt.

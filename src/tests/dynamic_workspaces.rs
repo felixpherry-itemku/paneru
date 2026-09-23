@@ -72,6 +72,14 @@ fn row_windows(world: &mut World, virtual_index: u32) -> Vec<WinID> {
         .collect()
 }
 
+/// The strip entity of row `virtual_index` of the test space.
+fn row_entity(world: &mut World, virtual_index: u32) -> Option<Entity> {
+    let mut query = world.query::<(Entity, &LayoutStrip)>();
+    query.iter(world).find_map(|(entity, strip)| {
+        (strip.id() == TEST_WORKSPACE_ID && strip.virtual_index == virtual_index).then_some(entity)
+    })
+}
+
 /// The text of the most recently spawned popup.
 fn latest_flash(world: &mut World) -> Option<String> {
     let mut query = world.query::<(&FlashMessage, &Timeout)>();
@@ -159,17 +167,24 @@ fn test_leaving_empty_first_row_removes_it() {
         ]);
 }
 
-/// T4: `alt-9` with one occupied row lands on the spare, creating nothing.
+/// T4: `alt-9` with one occupied row lands on the spare itself, creating
+/// nothing. (An uncapped switch would spawn row 8, which the invariant then
+/// compacts to index 1 as well, so the entity is what tells them apart.)
 #[test]
 fn test_numbered_switch_caps_at_spare() {
+    let spare = std::rc::Rc::new(std::cell::Cell::new(None));
+    let spare_before = spare.clone();
     TestHarness::new()
         .with_config(config())
         .with_windows(2)
-        .on_iteration(0, |world, _state| {
+        .on_iteration(0, move |world, _state| {
             assert_eq!(rows(world), [(0, 2, true), (1, 0, false)]);
+            spare_before.set(row_entity(world, 1));
         })
-        .on_iteration(1, |world, _state| {
+        .on_iteration(1, move |world, _state| {
             assert_eq!(rows(world), [(0, 2, false), (1, 0, true)]);
+            assert!(spare.get().is_some());
+            assert_eq!(row_entity(world, 1), spare.get());
             assert_eq!(latest_flash(world).as_deref(), Some("2"));
         })
         .run(vec![pump(), cmd(Operation::VirtualNumber(8))]);
@@ -455,12 +470,7 @@ fn test_direct_move_marker_caps_at_spare() {
         .with_config(config())
         .with_windows(2)
         .on_iteration(0, move |world, _state| {
-            let mut strips = world.query::<(Entity, &LayoutStrip)>();
-            spare_before.set(
-                strips
-                    .iter(world)
-                    .find_map(|(entity, strip)| (strip.virtual_index == 1).then_some(entity)),
-            );
+            spare_before.set(row_entity(world, 1));
             let focused = world
                 .query_filtered::<Entity, With<FocusedMarker>>()
                 .single(world)
@@ -472,12 +482,8 @@ fn test_direct_move_marker_caps_at_spare() {
         })
         .on_iteration(1, move |world, _state| {
             assert_eq!(rows(world), [(0, 1, true), (1, 1, false), (2, 0, false)]);
-            let mut strips = world.query::<(Entity, &LayoutStrip)>();
-            let filled = strips
-                .iter(world)
-                .find_map(|(entity, strip)| (strip.virtual_index == 1).then_some(entity));
             assert!(spare.get().is_some());
-            assert_eq!(filled, spare.get());
+            assert_eq!(row_entity(world, 1), spare.get());
         })
         .run(vec![pump(), pump()]);
 }
