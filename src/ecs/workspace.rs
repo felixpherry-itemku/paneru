@@ -1281,6 +1281,41 @@ pub(crate) fn show_active_workspace(
     }
 }
 
+/// One row of a space, in `virtual_index` order, as `dynamic_workspaces`
+/// sees it. Floating windows are not in the strip, so they don't occupy it.
+#[derive(Clone, Copy, Debug)]
+struct RowState {
+    occupied: bool,
+    shown: bool,
+}
+
+/// The rows (positions into `rows`) that survive under `dynamic_workspaces`,
+/// and whether a spare row must be appended. A row survives if it is
+/// occupied, shown, or last (the spare); a spare is needed iff the last row
+/// is occupied.
+fn plan_dynamic_rows(rows: &[RowState]) -> (Vec<usize>, bool) {
+    let Some(last) = rows.len().checked_sub(1) else {
+        return (vec![], false);
+    };
+    let keep = (0..rows.len())
+        .filter(|&i| rows[i].occupied || rows[i].shown || i == last)
+        .collect();
+    (keep, rows[last].occupied)
+}
+
+/// The `virtual_index` switches and moves clamp to under `dynamic_workspaces`:
+/// the empty last row, or one past an occupied last row. `rows` is
+/// `(virtual_index, occupied)` in `virtual_index` order. Uses real indexes,
+/// not positions, because a transient tick (right after restore, say) can
+/// still have gaps.
+fn spare_index(rows: &[(u32, bool)]) -> u32 {
+    match rows.last() {
+        None => 0,
+        Some(&(index, true)) => index + 1,
+        Some(&(index, false)) => index,
+    }
+}
+
 /// Resolves duplicate `virtual_index` values by reassigning each
 /// duplicate to the lowest unused index on its workspace. Triggered by
 /// `Added<LayoutStrip>` — the only event that can introduce a duplicate
@@ -1369,5 +1404,79 @@ fn reap_empty_virtual_workspaces(
         {
             entity_commands.try_despawn();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RowState, plan_dynamic_rows, spare_index};
+
+    fn rows(states: &[(bool, bool)]) -> Vec<RowState> {
+        states
+            .iter()
+            .map(|&(occupied, shown)| RowState { occupied, shown })
+            .collect()
+    }
+
+    #[test]
+    fn plan_dynamic_rows_cases() {
+        let cases: &[(&[(bool, bool)], &[usize], bool)] = &[
+            // T-P1: a lone occupied row needs a spare.
+            (&[(true, true)], &[0], true),
+            // T-P2: case (a), on the empty row 2.
+            (
+                &[(true, false), (false, true), (true, false)],
+                &[0, 1, 2],
+                true,
+            ),
+            // T-P3: case (a), left row 2.
+            (
+                &[(true, true), (false, false), (true, false), (false, false)],
+                &[0, 2, 3],
+                false,
+            ),
+            // T-P4: case (b), left row 1.
+            (
+                &[(false, false), (true, true), (false, false)],
+                &[1, 2],
+                false,
+            ),
+            // T-P5: case (b), still on row 1.
+            (
+                &[(false, true), (true, false), (false, false)],
+                &[0, 1, 2],
+                false,
+            ),
+            // T-P6: all empty, only the shown last row survives.
+            (
+                &[(false, false), (false, false), (false, true)],
+                &[2],
+                false,
+            ),
+            // T-P7: shown empty row before the spare.
+            (
+                &[(true, false), (false, true), (false, false)],
+                &[0, 1, 2],
+                false,
+            ),
+        ];
+        for (input, keep, spare) in cases {
+            assert_eq!(
+                plan_dynamic_rows(&rows(input)),
+                (keep.to_vec(), *spare),
+                "{input:?}"
+            );
+        }
+        assert_eq!(plan_dynamic_rows(&[]), (vec![], false));
+    }
+
+    #[test]
+    fn spare_index_cases() {
+        // T-P8
+        assert_eq!(spare_index(&[(0, true)]), 1);
+        assert_eq!(spare_index(&[(0, true), (1, false)]), 1);
+        assert_eq!(spare_index(&[(0, true), (1, false), (2, false)]), 2);
+        assert_eq!(spare_index(&[]), 0);
+        assert_eq!(spare_index(&[(0, true), (4, true)]), 5);
     }
 }
