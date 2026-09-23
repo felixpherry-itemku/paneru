@@ -346,7 +346,6 @@ mod tests {
     use super::super::worker::{Shared, StoreRequest, WorldRequest};
     use super::super::world::WorldAccess;
     use super::*;
-    use crate::commands::{Direction, Operation};
     use crate::ecs::state::PaneruQueryState;
     use crate::events::Event;
     use crate::platform::Modifiers;
@@ -499,13 +498,9 @@ mod tests {
             .unwrap();
         let binds = runtime.published_keybinds();
         assert_eq!(binds.len(), 1);
-        let (_, modifiers, id, command) = &binds[0];
-        assert_eq!(*modifiers, Modifiers::ALT);
-        assert_eq!(*id, 1);
-        assert_eq!(
-            *command,
-            Some(Command::Window(Operation::Focus(Direction::East)))
-        );
+        let (_, modifiers, id) = binds[0];
+        assert_eq!(modifiers, Modifiers::ALT);
+        assert_eq!(id, 1);
     }
 
     #[test]

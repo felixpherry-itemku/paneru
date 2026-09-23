@@ -25,6 +25,7 @@ use tracing::{error, info, warn};
 
 use crate::commands::Command;
 use crate::config::Config;
+use crate::ecs::overview::{CHORD_MODIFIERS, key_action};
 use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender};
 use crate::platform::Modifiers;
@@ -42,12 +43,14 @@ pub fn set_focused_passthrough(keys: Vec<(u8, Modifiers)>) {
     FOCUSED_PASSTHROUGH.store(Arc::new(keys));
 }
 
-/// Whether the overview is open. While set, the event tap consumes every key
-/// and forwards it as [`Event::OverviewKey`] instead of matching keybindings.
+/// Whether the overview is open. While set, the event tap routes keys through
+/// [`overview_route`]: bare overview keys become [`Event::OverviewKey`],
+/// bindings run as usual, other chords pass through and bare keys are
+/// swallowed.
 static OVERVIEW_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Switch the event tap in or out of overview mode. Every close path must clear
-/// it, or the keyboard stays swallowed.
+/// it, or bare typing stays swallowed.
 pub fn set_overview_active(active: bool) {
     OVERVIEW_ACTIVE.store(active, Ordering::Relaxed);
 }
@@ -96,10 +99,8 @@ impl Touch {
     }
 }
 
-/// A Lua-registered keybind: `(keycode, modifiers, handler_id, command)`.
-/// `command` is the parsed command of a command-string handler, `None` for a
-/// function handler — only a string says what it does without running it.
-pub type LuaKeybind = (u8, Modifiers, u32, Option<Command>);
+/// A Lua-registered keybind: `(keycode, modifiers, handler_id)`.
+pub type LuaKeybind = (u8, Modifiers, u32);
 
 /// Keybinds registered by the Lua runtime, shared lock-free with the event tap.
 /// Checked before the config bindings so a scripted bind can override a TOML
@@ -112,11 +113,6 @@ static LUA_KEYBINDS: LazyLock<ArcSwap<Vec<LuaKeybind>>> =
 #[cfg(feature = "lua")]
 pub fn set_lua_keybinds(keys: Vec<LuaKeybind>) {
     LUA_KEYBINDS.store(Arc::new(keys));
-}
-
-/// The current Lua keybind set, for the overview's modal key handling.
-pub fn lua_keybinds() -> Arc<Vec<LuaKeybind>> {
-    LUA_KEYBINDS.load_full()
 }
 
 const SWIPE_THRESHOLD: f64 = 0.001;
@@ -576,6 +572,9 @@ impl InputHandler {
 
     /// Handles key press events. It determines the modifier mask and attempts to find a matching keybinding in the configuration.
     /// If a binding is found, it sends a `Command` event and intercepts the key press.
+    /// While the overview is open, [`overview_route`] decides instead: overview
+    /// keys and bindings are sent and consumed, unbound chords pass through, and
+    /// bare keys are consumed unsent.
     ///
     /// # Arguments
     ///
@@ -592,18 +591,25 @@ impl InputHandler {
 
         let mask = get_modifiers(eventflags);
 
-        // The overview is modal: every key goes to it and none reaches an
-        // application. Consumed even if the send fails — a partially swallowed
-        // keyboard is worse than a fully swallowed one, and Escape always closes.
+        // Routed keys are consumed even if the send fails — a partially
+        // swallowed keyboard is worse than a fully swallowed one, and Escape
+        // always closes.
         if OVERVIEW_ACTIVE.load(Ordering::Relaxed) {
-            if let Ok(keycode) = u8::try_from(keycode) {
-                _ = events
-                    .send(Event::OverviewKey {
-                        keycode,
-                        modifiers: mask,
-                    })
-                    .inspect_err(|err| error!("Error sending overview key: {err}"));
-            }
+            let Ok(keycode) = u8::try_from(keycode) else {
+                return true;
+            };
+            let event = match overview_route(keycode, mask, self.binding(keycode, mask)) {
+                OverviewRoute::Overview => Event::OverviewKey {
+                    keycode,
+                    modifiers: mask,
+                },
+                OverviewRoute::Command(command) => Event::Command { command },
+                OverviewRoute::PassThrough => return false,
+                OverviewRoute::Swallow => return true,
+            };
+            _ = events
+                .send(event)
+                .inspect_err(|err| error!("Error sending overview key: {err}"));
             return true;
         }
 
@@ -613,24 +619,7 @@ impl InputHandler {
 
         let keycode = keycode.try_into().ok();
         keycode
-            .and_then(|keycode| {
-                let passthrough = FOCUSED_PASSTHROUGH.load();
-                if passthrough
-                    .iter()
-                    .any(|(c, m)| *c == keycode && m.matches(mask))
-                {
-                    return None;
-                }
-                // Lua-registered binds take precedence over the TOML config.
-                let lua_binds = LUA_KEYBINDS.load();
-                if let Some((_, _, id, _)) = lua_binds
-                    .iter()
-                    .find(|(c, m, _, _)| *c == keycode && m.matches(mask))
-                {
-                    return Some(Command::Lua(*id));
-                }
-                self.config.find_keybind(keycode, mask)
-            })
+            .and_then(|keycode| self.binding(keycode, mask))
             .and_then(|command| {
                 events
                     .send(Event::Command { command })
@@ -638,6 +627,60 @@ impl InputHandler {
                     .ok()
             })
             .is_some()
+    }
+
+    /// The command a key is bound to: none if the focused application opts
+    /// out of it, else a Lua bind, else a TOML one.
+    fn binding(&self, keycode: u8, mask: Modifiers) -> Option<Command> {
+        let passthrough = FOCUSED_PASSTHROUGH.load();
+        if passthrough
+            .iter()
+            .any(|(c, m)| *c == keycode && m.matches(mask))
+        {
+            return None;
+        }
+        // Lua-registered binds take precedence over the TOML config.
+        let lua_binds = LUA_KEYBINDS.load();
+        if let Some((_, _, id)) = lua_binds
+            .iter()
+            .find(|(c, m, _)| *c == keycode && m.matches(mask))
+        {
+            return Some(Command::Lua(*id));
+        }
+        self.config.find_keybind(keycode, mask)
+    }
+}
+
+/// Where a key goes while the overview is open.
+#[derive(Debug, PartialEq)]
+pub(crate) enum OverviewRoute {
+    /// A bare overview key: sent as [`Event::OverviewKey`].
+    Overview,
+    /// A Paneru binding: runs as usual, on the focused window.
+    Command(Command),
+    /// An unbound chord: left for macOS and other applications.
+    PassThrough,
+    /// An unbound bare key: typing never reaches the hidden focused window.
+    Swallow,
+}
+
+/// Routes a key pressed while the overview is open. `binding` is what the key
+/// is bound to outside the overview.
+pub(crate) fn overview_route(
+    keycode: u8,
+    modifiers: Modifiers,
+    binding: Option<Command>,
+) -> OverviewRoute {
+    if key_action(keycode, modifiers).is_some() {
+        return OverviewRoute::Overview;
+    }
+    if let Some(command) = binding {
+        return OverviewRoute::Command(command);
+    }
+    if modifiers.intersects(CHORD_MODIFIERS) {
+        OverviewRoute::PassThrough
+    } else {
+        OverviewRoute::Swallow
     }
 }
 
@@ -680,6 +723,7 @@ fn get_modifiers(eventflags: CGEventFlags) -> Modifiers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::{Direction, Operation};
 
     const NX_DEVICELALTKEYMASK: u64 = 0x0000_0020;
     const NX_DEVICERALTKEYMASK: u64 = 0x0000_0040;
@@ -778,6 +822,72 @@ mod tests {
         assert_eq!(
             get_modifiers(CGEventFlags(NX_DEVICEFNKEYMASK)),
             Modifiers::FN
+        );
+    }
+
+    const KEY_A: u8 = 0;
+    const KEY_X: u8 = 7;
+    const KEY_W: u8 = 13;
+    const KEY_L: u8 = 37;
+    const KEY_RETURN: u8 = 36;
+    const KEY_ESCAPE: u8 = 53;
+    const KEY_KEYPAD_ENTER: u8 = 76;
+
+    #[test]
+    fn overview_keys_route_to_the_overview() {
+        for keycode in [KEY_ESCAPE, KEY_RETURN, KEY_KEYPAD_ENTER, 123, 124, 125, 126] {
+            assert_eq!(
+                overview_route(keycode, Modifiers::empty(), None),
+                OverviewRoute::Overview
+            );
+        }
+        assert_eq!(
+            overview_route(KEY_RETURN, Modifiers::LALT, None),
+            OverviewRoute::PassThrough,
+            "unbound alt+Return is not Return"
+        );
+    }
+
+    #[test]
+    fn bound_keys_in_the_overview_run_their_command() {
+        let swap = Command::Window(Operation::Swap(Direction::East));
+        assert_eq!(
+            overview_route(
+                KEY_L,
+                Modifiers::LALT | Modifiers::LSHIFT,
+                Some(swap.clone())
+            ),
+            OverviewRoute::Command(swap)
+        );
+        assert_eq!(
+            overview_route(KEY_A, Modifiers::empty(), Some(Command::Lua(1))),
+            OverviewRoute::Command(Command::Lua(1)),
+            "a bound bare key runs too"
+        );
+        assert_eq!(
+            overview_route(KEY_ESCAPE, Modifiers::empty(), Some(Command::Lua(1))),
+            OverviewRoute::Overview,
+            "Escape can't be bound away"
+        );
+    }
+
+    #[test]
+    fn unbound_keys_in_the_overview_pass_chords_and_swallow_typing() {
+        assert_eq!(
+            overview_route(KEY_W, Modifiers::LCMD, None),
+            OverviewRoute::PassThrough
+        );
+        assert_eq!(
+            overview_route(KEY_X, Modifiers::LCTRL, None),
+            OverviewRoute::PassThrough
+        );
+        assert_eq!(
+            overview_route(KEY_A, Modifiers::empty(), None),
+            OverviewRoute::Swallow
+        );
+        assert_eq!(
+            overview_route(KEY_A, Modifiers::LSHIFT, None),
+            OverviewRoute::Swallow
         );
     }
 

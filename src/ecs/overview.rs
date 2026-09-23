@@ -34,7 +34,7 @@ use crate::events::Event;
 use crate::manager::{Display, Window};
 use crate::overlay::{OverviewRenderer, OverviewScene, SceneRow, SceneTile};
 use crate::platform::Modifiers;
-use crate::platform::input::{LuaKeybind, lua_keybinds, set_overview_active};
+use crate::platform::input::set_overview_active;
 
 /// Escape. Always closes, so a swallowed keyboard can never get stuck.
 const KEY_ESCAPE: u8 = 53;
@@ -54,41 +54,24 @@ pub(crate) enum KeyAction {
     Move(Direction),
 }
 
-/// Maps a key to its overview action. The hardcoded keys come first, so
-/// Escape can never be rebound away.
-pub(crate) fn key_action(
-    keycode: u8,
-    modifiers: Modifiers,
-    config: Option<&Config>,
-    lua_binds: &[LuaKeybind],
-) -> Option<KeyAction> {
-    match keycode {
-        KEY_ESCAPE | KEY_RETURN | KEY_KEYPAD_ENTER => return Some(KeyAction::Close),
-        KEY_LEFT => return Some(KeyAction::Move(Direction::West)),
-        KEY_RIGHT => return Some(KeyAction::Move(Direction::East)),
-        KEY_DOWN => return Some(KeyAction::Move(Direction::South)),
-        KEY_UP => return Some(KeyAction::Move(Direction::North)),
-        _ => {}
+/// Modifiers that make a key a chord: with any of these held a key is never an
+/// overview key and, unbound, passes through to macOS. Shift and Fn never do —
+/// arrow keys carry an implicit Fn flag.
+pub(crate) const CHORD_MODIFIERS: Modifiers =
+    Modifiers::ALT.union(Modifiers::CMD).union(Modifiers::CTRL);
+
+/// Maps a bare key to its overview action. Chords are left to the bindings and
+/// macOS, so `alt+Return` never reads as Return.
+pub(crate) fn key_action(keycode: u8, modifiers: Modifiers) -> Option<KeyAction> {
+    if modifiers.intersects(CHORD_MODIFIERS) {
+        return None;
     }
-    // The user's own focus chords mean what they mean outside the overview,
-    // so `alt+j` needs no second binding table to mean "down" in here. Lua
-    // binds shadow TOML ones, as in the event tap; one with a function handler
-    // means nothing here.
-    let lua_bind = lua_binds
-        .iter()
-        .find(|(code, mask, _, _)| *code == keycode && mask.matches(modifiers));
-    let command = match lua_bind {
-        Some((_, _, _, command)) => command.clone()?,
-        None => config?.find_keybind(keycode, modifiers)?,
-    };
-    match command {
-        Command::Overview => Some(KeyAction::Close),
-        // Rows are workspaces, so a workspace switch moves between rows too.
-        Command::Window(
-            Operation::Focus(direction)
-            | Operation::FocusOrVirtual(direction)
-            | Operation::Virtual(direction),
-        ) => Some(KeyAction::Move(direction)),
+    match keycode {
+        KEY_ESCAPE | KEY_RETURN | KEY_KEYPAD_ENTER => Some(KeyAction::Close),
+        KEY_LEFT => Some(KeyAction::Move(Direction::West)),
+        KEY_RIGHT => Some(KeyAction::Move(Direction::East)),
+        KEY_DOWN => Some(KeyAction::Move(Direction::South)),
+        KEY_UP => Some(KeyAction::Move(Direction::North)),
         _ => None,
     }
 }
@@ -389,8 +372,8 @@ impl Plugin for OverviewPlugin {
     }
 }
 
-/// Opens the overview on `Command::Overview`; a second one starts it closing.
-/// Keys pressed while it is open never become commands — see `overview_input`.
+/// Opens the overview on `Command::Overview`; a second one — the overview
+/// binding pressed while it is open — starts it closing.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn overview_toggle(
     mut messages: MessageReader<Event>,
@@ -434,7 +417,6 @@ fn overview_input(
     mut overview: ResMut<Overview>,
     mission_control: Res<MissionControlActive>,
     displays: Query<&Display, With<ActiveDisplayMarker>>,
-    config: Option<Res<Config>>,
     mut commands: Commands,
 ) {
     // It only ever shows the display it opened on.
@@ -447,7 +429,7 @@ fn overview_input(
         }
         match event {
             Event::OverviewKey { keycode, modifiers } => {
-                match key_action(*keycode, *modifiers, config.as_deref(), &lua_keybinds()) {
+                match key_action(*keycode, *modifiers) {
                     Some(KeyAction::Close) => overview.close(None),
                     Some(KeyAction::Move(direction)) => {
                         // Rows are workspaces: up and down leave a stack for

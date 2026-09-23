@@ -399,22 +399,11 @@ fn register_bind(registry: &SharedRegistry, chord: &str, handler: Value) -> mlua
     let (code, modifiers) = resolve_chord(chord)
         .map_err(|err| mlua::Error::RuntimeError(format!("paneru.bind: {err}")))?;
 
-    // Parsed up front so the overview can tell what the chord means without a
-    // round trip to this thread. A bad string still only errors on dispatch.
-    let command = match &handler {
-        Value::String(command) => {
-            let command = command.to_string_lossy();
-            let argv: Vec<&str> = command.split_whitespace().collect();
-            crate::config::parse_command(&argv).ok()
-        }
-        _ => None,
-    };
-
     let mut registry = registry.borrow_mut();
     registry.binds.push(handler);
     let id = u32::try_from(registry.binds.len())
         .map_err(|_| mlua::Error::RuntimeError("paneru.bind: too many binds".into()))?;
-    registry.keybinds.push((code, modifiers, id, command));
+    registry.keybinds.push((code, modifiers, id));
     Ok(())
 }
 

@@ -384,44 +384,35 @@ fn test_overview_mid_frame_only_while_animating() {
 
 // ── Key mapping (pure) ─────────────────────────────────────────────────────
 
-/// A config from `init.lua` has no TOML bindings at all: every chord lives in
-/// the Lua keybind set, so that is where the overview must look.
 #[test]
-fn test_overview_keys_follow_lua_binds() {
-    const KEY_O: u8 = 31;
-    const KEY_H: u8 = 4;
-    const KEY_F: u8 = 3;
-    let binds = [
-        (KEY_O, Modifiers::ALT, 1, Some(Command::Overview)),
-        (
-            KEY_H,
-            Modifiers::ALT,
-            2,
-            Some(Command::Window(Operation::Focus(Direction::West))),
-        ),
-        // A function handler: nothing to map.
-        (KEY_F, Modifiers::ALT, 3, None),
-    ];
+fn test_overview_key_action_maps_bare_keys_only() {
+    const KEY_KEYPAD_ENTER: u8 = 76;
+    const KEY_LEFT: u8 = 123;
+    const KEY_UP: u8 = 126;
+    let bare = Modifiers::empty();
+    for keycode in [KEY_ESCAPE, KEY_RETURN, KEY_KEYPAD_ENTER] {
+        assert_eq!(key_action(keycode, bare), Some(KeyAction::Close));
+    }
+    for (keycode, direction) in [
+        (KEY_LEFT, Direction::West),
+        (KEY_RIGHT, Direction::East),
+        (KEY_DOWN, Direction::South),
+        (KEY_UP, Direction::North),
+    ] {
+        assert_eq!(key_action(keycode, bare), Some(KeyAction::Move(direction)));
+    }
+    assert_eq!(key_action(KEY_RETURN, Modifiers::LALT), None, "alt+Return");
+    assert_eq!(key_action(KEY_LEFT, Modifiers::LCMD), None, "cmd+Left");
     assert_eq!(
-        key_action(KEY_O, Modifiers::ALT, None, &binds),
-        Some(KeyAction::Close)
+        key_action(KEY_LEFT, Modifiers::LSHIFT),
+        Some(KeyAction::Move(Direction::West)),
+        "shift is not a chord"
     );
     assert_eq!(
-        key_action(KEY_H, Modifiers::ALT, None, &binds),
-        Some(KeyAction::Move(Direction::West))
+        key_action(KEY_LEFT, Modifiers::FN),
+        Some(KeyAction::Move(Direction::West)),
+        "arrows can carry Fn"
     );
-    assert_eq!(key_action(KEY_F, Modifiers::ALT, None, &binds), None);
-    let virtual_south = [(
-        KEY_H,
-        Modifiers::ALT,
-        4,
-        Some(Command::Window(Operation::Virtual(Direction::South))),
-    )];
-    assert_eq!(
-        key_action(KEY_H, Modifiers::ALT, None, &virtual_south),
-        Some(KeyAction::Move(Direction::South))
-    );
-    assert_eq!(key_action(KEY_H, Modifiers::empty(), None, &binds), None);
 }
 
 // ── Live focus (harness) ───────────────────────────────────────────────────
