@@ -12,10 +12,11 @@ use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSBezierPath, NSColor, NSCompositingOperation, NSFont, NSGraphicsContext, NSImage,
-    NSParagraphStyle, NSRunningApplication, NSScreenSaverWindowLevel, NSView, NSWindow,
+    NSParagraphStyle, NSRunningApplication, NSScreen, NSScreenSaverWindowLevel, NSView, NSWindow,
+    NSWorkspace,
 };
 use objc2_core_foundation::CGFloat;
-use objc2_core_graphics::CGBitmapContextCreateImage;
+use objc2_core_graphics::{CGBitmapContextCreateImage, CGDirectDisplayID};
 use objc2_foundation::{
     NSAttributedString, NSDictionary, NSMutableCopying, NSPoint, NSRect, NSSize, NSString,
 };
@@ -24,7 +25,7 @@ use super::{cg_abs_to_cocoa, make_overlay_window, primary_screen_height};
 use crate::events::EventSender;
 use crate::platform::input::set_overview_window;
 use crate::platform::{Pid, WinID};
-use crate::util::rgba_bitmap_context;
+use crate::util::{read_screen_property, rgba_bitmap_context};
 
 /// Everything one overview frame needs, as plain data. Compared against the
 /// previous frame so an unchanged scene skips the redraw.
@@ -32,6 +33,8 @@ use crate::util::rgba_bitmap_context;
 pub struct OverviewScene {
     /// The whole display the overview covers, in absolute CG coordinates.
     pub display: IRect,
+    /// That display's id, for looking up its desktop picture.
+    pub display_id: CGDirectDisplayID,
     /// 0.0 = closed, 1.0 = fully open. Fades the scrim and tiles.
     pub progress: f32,
     pub scrim_opacity: f32,
@@ -179,6 +182,23 @@ fn draw_image(image: &NSImage, rect: NSRect, alpha: f64) {
     }
 }
 
+/// Where to draw `image` so it covers `bounds` at its own aspect ratio:
+/// scaled up or down to fill, centred, overflowing on one axis.
+fn aspect_fill(image: NSSize, bounds: NSRect) -> NSRect {
+    if image.width <= 0.0 || image.height <= 0.0 {
+        return bounds;
+    }
+    let scale = (bounds.size.width / image.width).max(bounds.size.height / image.height);
+    let size = NSSize::new(image.width * scale, image.height * scale);
+    NSRect::new(
+        NSPoint::new(
+            bounds.origin.x + (bounds.size.width - size.width) / 2.0,
+            bounds.origin.y + (bounds.size.height - size.height) / 2.0,
+        ),
+        size,
+    )
+}
+
 /// One window: its captured thumbnail if one has arrived, otherwise a rounded
 /// card with the app icon centred and the title beneath it.
 fn draw_tile(
@@ -268,6 +288,8 @@ struct OverviewViewState {
     /// Window captures, filled in as they arrive. Dropped with the view when
     /// the overview closes: a stale thumbnail is worse than a placeholder.
     thumbnails: HashMap<WinID, Retained<NSImage>>,
+    /// The display's desktop picture, if it has a still one.
+    wallpaper: Option<Retained<NSImage>>,
 }
 
 define_class!(
@@ -284,9 +306,20 @@ define_class!(
             let state = self.ivars().borrow();
             let scene = &state.scene;
             let progress = f64::from(scene.progress);
+            let bounds = self.bounds();
 
+            // Opaque once open either way, so no live window shows through.
+            // ponytail: a full-size wallpaper is rescaled on every frame of the
+            // zoom; if that stutters, pre-render it once at display size with
+            // `rgba_bitmap_context` + `CGBitmapContextCreateImage` and cache it.
+            if let Some(wallpaper) = &state.wallpaper {
+                draw_image(wallpaper, aspect_fill(wallpaper.size(), bounds), progress);
+            } else {
+                srgb(scene.scrim_color, progress).setFill();
+                NSBezierPath::fillRect(bounds);
+            }
             srgb(scene.scrim_color, f64::from(scene.scrim_opacity) * progress).setFill();
-            NSBezierPath::fillRect(self.bounds());
+            NSBezierPath::fillRect(bounds);
 
             let origin = scene.display.min;
             for row in &scene.rows {
@@ -324,6 +357,9 @@ pub struct OverviewRenderer {
     events: EventSender,
     /// Windows a capture was already asked for during this open.
     requested: HashSet<WinID>,
+    /// The last desktop picture decoded, keyed by its URL. Kept across opens,
+    /// so only the first open pays for decoding it.
+    wallpaper: Option<(String, Retained<NSImage>)>,
 }
 
 impl OverviewRenderer {
@@ -334,7 +370,26 @@ impl OverviewRenderer {
             scene: None,
             events,
             requested: HashSet::new(),
+            wallpaper: None,
         }
+    }
+
+    /// `display`'s desktop picture. `None` for a wallpaper with no still image
+    /// behind it (dynamic, aerial) or one that fails to load.
+    fn wallpaper(&mut self, display: CGDirectDisplayID) -> Option<Retained<NSImage>> {
+        let url = read_screen_property(&NSScreen::screens(self.mtm), display, |screen| {
+            NSWorkspace::sharedWorkspace().desktopImageURLForScreen(&screen)
+        })
+        .flatten()?;
+        let key = url.absoluteString()?.to_string();
+        if let Some((cached, image)) = &self.wallpaper
+            && *cached == key
+        {
+            return Some(image.clone());
+        }
+        let image = NSImage::initWithContentsOfURL(NSImage::alloc(), &url)?;
+        self.wallpaper = Some((key, image.clone()));
+        Some(image)
     }
 
     /// Shows `scene`, creating the window on first use. A no-op when the scene
@@ -345,6 +400,9 @@ impl OverviewRenderer {
         }
         let frame = cg_abs_to_cocoa(ns_rect(scene.display), primary_screen_height(self.mtm));
         let resized = self.scene.as_ref().map(|old| old.display) != Some(scene.display);
+        // Also true on the first frame of an open: `close` forgets the scene.
+        let wallpaper = (self.scene.as_ref().map(|old| old.display_id) != Some(scene.display_id))
+            .then(|| self.wallpaper(scene.display_id));
         let (window, view) = self.window.get_or_insert_with(|| {
             let window = make_overlay_window(self.mtm, frame);
             // Above every application window, the menu bar and the Dock.
@@ -366,6 +424,9 @@ impl OverviewRenderer {
 
         {
             let mut state = view.ivars().borrow_mut();
+            if let Some(wallpaper) = wallpaper {
+                state.wallpaper = wallpaper;
+            }
             for tile in &scene.tiles {
                 state.icons.entry(tile.pid).or_insert_with(|| {
                     NSRunningApplication::runningApplicationWithProcessIdentifier(tile.pid)
@@ -449,5 +510,22 @@ impl OverviewRenderer {
         }
         self.scene = None;
         self.requested.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::float_cmp, reason = "exact binary fractions")]
+    fn wide_wallpaper_fills_the_height_and_overflows_the_width_centred() {
+        let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1000.0, 800.0));
+        let rect = aspect_fill(NSSize::new(3000.0, 1000.0), bounds);
+        assert_eq!(rect.size.height, 800.0);
+        assert_eq!(rect.size.width, 2400.0);
+        assert_eq!(rect.origin.x, -700.0);
+        assert_eq!(rect.origin.y, 0.0);
+        assert_eq!(aspect_fill(NSSize::new(0.0, 0.0), bounds), bounds);
     }
 }

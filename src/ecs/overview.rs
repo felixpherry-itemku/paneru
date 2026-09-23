@@ -587,6 +587,7 @@ fn overview_render(
 
     renderer.render(OverviewScene {
         display: bounds,
+        display_id: active_display.id(),
         progress: overview.progress,
         scrim_opacity: config.overview_scrim_opacity(),
         scrim_color: config.overview_scrim_color(),
