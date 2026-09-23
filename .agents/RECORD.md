@@ -1,5 +1,7 @@
 # Record
 
-**Overview input.** While the overview is open the `CGEventTap` in `src/platform/input.rs` consumes every key event and routes it to the overview instead of the focused application. Selection is deferred: moving the cursor changes no window state, and only activation (Enter or click) switches virtual workspace and moves focus. Cursor movement is delegated to `get_window_in_direction`, so overview navigation and the `window_focus_*` bindings share one rule.
+**Overview input.** While the overview is open the `CGEventTap` in `src/platform/input.rs` routes bare Escape, Return and arrow keys to the overview, runs Paneru keybindings as usual, passes every other command, option or control chord through to macOS and other applications, and swallows the remaining bare keys. Selection is the real focus: focus and workspace moves made while the overview is open act on the live layout behind it, and closing leaves focus where it is. A click is taken by the overview only when the overview window is under the pointer.
+
+**Overview backdrop.** The overview draws an opaque backdrop — the display's desktop wallpaper, else the scrim colour — so no application window shows through it.
 
 **Screen capture.** Overview tiles carry window thumbnails captured through ScreenCaptureKit on macOS 14 and later, which requires the Screen Recording permission. This is the only feature in Paneru that needs a permission beyond Accessibility; when it is unavailable, tiles fall back to the application icon and window title and nothing else degrades.
