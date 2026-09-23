@@ -425,9 +425,9 @@ impl Plugin for OverviewPlugin {
             PreUpdate,
             (
                 overview_toggle,
-                overview_input
+                (overview_input, overview_thumbnail)
                     .after(overview_toggle)
-                    .run_if(resource_exists::<Overview>),
+                    .distributive_run_if(resource_exists::<Overview>),
             ),
         );
         app.add_systems(
@@ -642,6 +642,7 @@ fn overview_render(
         .map(|tile| {
             let window = windows.get(tile.entity);
             SceneTile {
+                window_id: window.map(|window| window.id()).unwrap_or_default(),
                 pid: window
                     .and_then(|window| window.pid().ok())
                     .unwrap_or_default(),
@@ -662,6 +663,7 @@ fn overview_render(
         scrim_opacity: config.overview_scrim_opacity(),
         scrim_color: config.overview_scrim_color(),
         label_height: config.overview_label_height(),
+        thumbnails: config.overview_thumbnails(),
         rows,
         tiles,
     });
@@ -738,4 +740,40 @@ fn finish_close(
         renderer.close();
     }
     commands.remove_resource::<Overview>();
+}
+
+/// Hands arriving thumbnails to the renderer. One for a window that is no
+/// longer projected — closed since the capture was requested — is dropped.
+#[instrument(level = Level::DEBUG, skip_all)]
+fn overview_thumbnail(
+    mut messages: MessageReader<Event>,
+    overview: Res<Overview>,
+    windows: Windows,
+    renderer: Option<NonSendMut<OverviewRenderer>>,
+) {
+    let mut renderer = renderer;
+    for event in messages.read() {
+        let Event::OverviewThumbnail {
+            window_id,
+            width,
+            height,
+            rgba,
+        } = event
+        else {
+            continue;
+        };
+        let projected = overview
+            .layout
+            .rows
+            .iter()
+            .flat_map(|row| &row.tiles)
+            .any(|tile| {
+                windows
+                    .get(tile.entity)
+                    .is_some_and(|window| window.id() == *window_id)
+            });
+        if let Some(renderer) = renderer.as_mut().filter(|_| projected) {
+            renderer.store_thumbnail(*window_id, *width, *height, rgba.clone());
+        }
+    }
 }

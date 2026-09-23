@@ -78,6 +78,10 @@ inspired by [Niri] and [PaperWM.spoon].
 - Check your System Settings for "Displays have separate spaces" option. It
   should be enabled - this allows Paneru to manage the workspaces independently.
 
+- Optionally, grant Screen Recording permission ("Privacy & Security -> Screen &
+  System Audio Recording") to see window thumbnails in the overview (macOS 14+).
+  Without it the overview shows app icons and titles instead.
+
 - **Multiple displays**. Paneru is moving the windows off-screen, hiding them
   to the left or right. If you have multiple displays, for example your laptop
   open when docked to an external monitor you may experience weird behavior.
@@ -291,6 +295,7 @@ $ paneru send-cmd <command> [args...]
 | `window virtualsendnum <n>` | Send the window to numbered virtual workspace but stay |
 | `window snap`              | Snap the focused window into the visible viewport |
 | `mouse nextdisplay`        | Warp the mouse pointer to the next display       |
+| `overview`                 | Toggle the overview of all virtual workspaces    |
 | `printstate`               | Print the internal ECS state to the debug log    |
 | `quit`                     | Quit Paneru                                      |
 | `restart`                  | Restart the Paneru service                         |

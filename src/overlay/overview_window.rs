@@ -3,7 +3,7 @@
 //! window above every application.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bevy::math::{IRect, IVec2};
 use objc2::AnyThread;
@@ -11,16 +11,19 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSBezierPath, NSColor, NSCompositingOperation, NSFont, NSImage, NSParagraphStyle,
-    NSRunningApplication, NSScreenSaverWindowLevel, NSView, NSWindow,
+    NSBezierPath, NSColor, NSCompositingOperation, NSFont, NSGraphicsContext, NSImage,
+    NSParagraphStyle, NSRunningApplication, NSScreenSaverWindowLevel, NSView, NSWindow,
 };
 use objc2_core_foundation::CGFloat;
+use objc2_core_graphics::CGBitmapContextCreateImage;
 use objc2_foundation::{
     NSAttributedString, NSDictionary, NSMutableCopying, NSPoint, NSRect, NSSize, NSString,
 };
 
 use super::{cg_abs_to_cocoa, make_overlay_window, primary_screen_height};
-use crate::platform::Pid;
+use crate::events::EventSender;
+use crate::platform::{Pid, WinID};
+use crate::util::rgba_bitmap_context;
 
 /// Everything one overview frame needs, as plain data. Compared against the
 /// previous frame so an unchanged scene skips the redraw.
@@ -34,6 +37,8 @@ pub struct OverviewScene {
     pub scrim_color: [f64; 3],
     /// Height of each band's label strip, in points.
     pub label_height: i32,
+    /// Whether to capture window thumbnails (`[overview] thumbnails`).
+    pub thumbnails: bool,
     pub rows: Vec<SceneRow>,
     pub tiles: Vec<SceneTile>,
 }
@@ -48,6 +53,7 @@ pub struct SceneRow {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SceneTile {
+    pub window_id: WinID,
     pub pid: Pid,
     /// Absolute CG coordinates, already interpolated for `progress`.
     pub frame: IRect,
@@ -158,8 +164,29 @@ const SELECTED: [f64; 3] = [0.30, 0.60, 1.0];
 const TILE_RADIUS: CGFloat = 10.0;
 const TITLE_FONT_SIZE: CGFloat = 12.0;
 
-/// One window: rounded card, app icon centred, title beneath it.
-fn draw_tile(tile: &SceneTile, icon: Option<&NSImage>, origin: IVec2, progress: f64) {
+/// Draws `image` over the whole of `rect` at `alpha`.
+fn draw_image(image: &NSImage, rect: NSRect, alpha: f64) {
+    unsafe {
+        image.drawInRect_fromRect_operation_fraction_respectFlipped_hints(
+            rect,
+            NSRect::ZERO,
+            NSCompositingOperation::SourceOver,
+            alpha,
+            true,
+            None,
+        );
+    }
+}
+
+/// One window: its captured thumbnail if one has arrived, otherwise a rounded
+/// card with the app icon centred and the title beneath it.
+fn draw_tile(
+    tile: &SceneTile,
+    icon: Option<&NSImage>,
+    thumbnail: Option<&NSImage>,
+    origin: IVec2,
+    progress: f64,
+) {
     let rect = local_rect(tile.frame, origin);
     if rect.size.width < 1.0 || rect.size.height < 1.0 {
         return;
@@ -179,6 +206,17 @@ fn draw_tile(tile: &SceneTile, icon: Option<&NSImage>, origin: IVec2, progress: 
     };
     path.setLineWidth(width);
     srgb(border, alpha).setStroke();
+
+    if let Some(thumbnail) = thumbnail
+        && let Some(context) = NSGraphicsContext::currentContext()
+    {
+        context.saveGraphicsState();
+        path.addClip();
+        draw_image(thumbnail, rect, progress);
+        context.restoreGraphicsState();
+        path.stroke();
+        return;
+    }
     path.stroke();
 
     let title_height = TITLE_FONT_SIZE * 1.5;
@@ -197,16 +235,7 @@ fn draw_tile(tile: &SceneTile, icon: Option<&NSImage>, origin: IVec2, progress: 
             NSPoint::new(rect.origin.x + (rect.size.width - icon_size) / 2.0, top),
             NSSize::new(icon_size, icon_size),
         );
-        unsafe {
-            icon.drawInRect_fromRect_operation_fraction_respectFlipped_hints(
-                icon_rect,
-                NSRect::ZERO,
-                NSCompositingOperation::SourceOver,
-                progress,
-                true,
-                None,
-            );
-        }
+        draw_image(icon, icon_rect, progress);
     }
 
     let caption = if tile.tab_count > 1 {
@@ -235,6 +264,9 @@ fn draw_tile(tile: &SceneTile, icon: Option<&NSImage>, origin: IVec2, progress: 
 struct OverviewViewState {
     scene: OverviewScene,
     icons: HashMap<Pid, Retained<NSImage>>,
+    /// Window captures, filled in as they arrive. Dropped with the view when
+    /// the overview closes: a stale thumbnail is worse than a placeholder.
+    thumbnails: HashMap<WinID, Retained<NSImage>>,
 }
 
 define_class!(
@@ -261,7 +293,8 @@ define_class!(
             }
             for tile in &scene.tiles {
                 let icon = state.icons.get(&tile.pid).map(|icon| &**icon);
-                draw_tile(tile, icon, origin, progress);
+                let thumbnail = state.thumbnails.get(&tile.window_id).map(|image| &**image);
+                draw_tile(tile, icon, thumbnail, origin, progress);
             }
         }
 
@@ -285,14 +318,21 @@ pub struct OverviewRenderer {
     mtm: MainThreadMarker,
     window: Option<(Retained<NSWindow>, Retained<OverviewView>)>,
     scene: Option<OverviewScene>,
+    /// Where captured thumbnails are delivered.
+    #[cfg_attr(not(feature = "thumbnails"), allow(dead_code))]
+    events: EventSender,
+    /// Windows a capture was already asked for during this open.
+    requested: HashSet<WinID>,
 }
 
 impl OverviewRenderer {
-    pub fn new(mtm: MainThreadMarker) -> Self {
+    pub fn new(mtm: MainThreadMarker, events: EventSender) -> Self {
         Self {
             mtm,
             window: None,
             scene: None,
+            events,
+            requested: HashSet::new(),
         }
     }
 
@@ -331,14 +371,77 @@ impl OverviewRenderer {
             state.scene = scene.clone();
         }
         view.setNeedsDisplay(true);
+
+        // Only once the window is up and settled: a slow capture round-trip
+        // must never hold up the open animation, and settled tiles have their
+        // final size to capture at.
+        if scene.thumbnails && scene.progress >= 1.0 {
+            let scale = window.backingScaleFactor();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let pixels = |points: i32| (f64::from(points) * scale).round().max(1.0) as u32;
+            let requests = scene
+                .tiles
+                .iter()
+                .filter(|tile| self.requested.insert(tile.window_id))
+                .map(|tile| {
+                    (
+                        tile.window_id,
+                        pixels(tile.frame.width()),
+                        pixels(tile.frame.height()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            #[cfg(feature = "thumbnails")]
+            crate::manager::capture::request_thumbnails(requests, self.events.clone());
+            #[cfg(not(feature = "thumbnails"))]
+            drop(requests);
+        }
         self.scene = Some(scene);
+    }
+
+    /// Caches a captured thumbnail, rebuilding the image here on the main
+    /// thread from the plain RGBA bytes the capture callback sent.
+    pub fn store_thumbnail(
+        &mut self,
+        window_id: WinID,
+        width: u32,
+        height: u32,
+        mut rgba: Vec<u8>,
+    ) {
+        let Some((_, view)) = &self.window else {
+            return;
+        };
+        let (Ok(width), Ok(height)) = (usize::try_from(width), usize::try_from(height)) else {
+            return;
+        };
+        if rgba.len() < width * height * 4 {
+            return;
+        }
+        let Some(context) =
+            (unsafe { rgba_bitmap_context(rgba.as_mut_ptr().cast(), width, height) })
+        else {
+            return;
+        };
+        let Some(image) = CGBitmapContextCreateImage(Some(&context)) else {
+            return;
+        };
+        let image = NSImage::initWithCGImage_size(NSImage::alloc(), &image, NSSize::ZERO);
+        view.ivars()
+            .borrow_mut()
+            .thumbnails
+            .insert(window_id, image);
+        view.setNeedsDisplay(true);
     }
 
     /// Takes the window down and forgets everything drawn in it.
     pub fn close(&mut self) {
-        if let Some((window, _)) = self.window.take() {
+        if let Some((window, view)) = self.window.take() {
             window.orderOut(None::<&AnyObject>);
+            // Explicitly, rather than trusting AppKit to free the view with
+            // the window: a stale thumbnail is worse than a placeholder.
+            *view.ivars().borrow_mut() = OverviewViewState::default();
         }
         self.scene = None;
+        self.requested.clear();
     }
 }

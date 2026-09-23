@@ -267,6 +267,53 @@ $ paneru send-cmd window virtualmovenum 3
 $ paneru send-cmd window virtualsendnum 3
 ```
 
+### Overview
+
+`overview` toggles a zoomed-out map of the active display: one band per virtual
+workspace, each window drawn as a tile at its real place in the strip —
+including windows on parked workspaces and columns scrolled off screen. There is
+no default binding.
+
+```toml
+[bindings]
+overview = "alt - tab"
+```
+
+While the overview is open it takes the whole keyboard, and nothing moves until
+you commit:
+
+| Key | Effect |
+| :--- | :--- |
+| Arrow keys | Move the selection |
+| Your `window_focus_*` / `window_virtualfocus_*` bindings | Move the selection, exactly as they move focus outside the overview |
+| `Return` / keypad `Enter` | Focus the selected window (switching workspace if needed) and close |
+| `Escape`, or the `overview` binding again | Close, leaving focus and layout untouched |
+
+Clicking a tile focuses that window; clicking anywhere else closes the overview.
+It will not open while Mission Control is showing.
+
+The optional `[overview]` table tunes it:
+
+```toml
+[overview]
+animation_speed = 14.0         # zoom speed; defaults to options.animation_speed
+scrim_opacity = 0.85           # backdrop opacity once fully open (0.0 - 1.0)
+scrim_color = [0.05, 0.05, 0.07]
+row_gap = 24                   # points between workspace bands
+label_height = 20              # points reserved for each band's number
+thumbnails = true              # capture window thumbnails (see below)
+```
+
+**Thumbnails** need macOS 14 or later and the **Screen Recording** permission
+(System Settings → Privacy & Security → Screen & System Audio Recording). This
+is the only feature in Paneru that needs more than Accessibility. Without it —
+or with `thumbnails = false` — tiles show the app icon and window title instead,
+and nothing else changes. As with Accessibility, a locally rebuilt, ad-hoc
+signed binary loses the grant on every build.
+
+Thumbnail support can also be left out at compile time by building without the
+default `thumbnails` cargo feature.
+
 See [QUERY_AND_SUBSCRIBE_FORMAT.md](QUERY_AND_SUBSCRIBE_FORMAT.md) for the
 structured `paneru query` responses and `paneru subscribe` event stream.
 

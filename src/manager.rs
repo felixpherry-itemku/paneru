@@ -53,6 +53,8 @@ pub use process::MockProcessApi;
 pub use windows::MockWindowApi;
 
 pub(crate) mod app;
+#[cfg(feature = "thumbnails")]
+pub mod capture;
 mod display;
 mod process;
 mod skylight;

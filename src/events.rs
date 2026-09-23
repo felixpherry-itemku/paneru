@@ -201,7 +201,9 @@ pub enum Event {
     /// key in that state and forwards it here instead of to any application.
     OverviewKey { keycode: u8, modifiers: Modifiers },
     /// A window thumbnail captured for the overview, as plain RGBA bytes so
-    /// nothing non-`Send` crosses the channel from the capture callback.
+    /// nothing non-`Send` crosses the channel from the capture callback. Only
+    /// ever produced by the `thumbnails` feature's capture module.
+    #[cfg_attr(not(feature = "thumbnails"), allow(dead_code))]
     OverviewThumbnail {
         window_id: WinID,
         width: u32,

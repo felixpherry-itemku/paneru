@@ -712,6 +712,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     }
 
     let menu_events = sender.clone();
+    let overview_events = sender.clone();
     let mut platform_callbacks = PlatformCallbacks::new(sender);
     platform_callbacks.setup_handlers()?;
     let mtm = platform_callbacks.main_thread_marker;
@@ -720,7 +721,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     let menu_bar_manager = MenuBarManager::new(mtm, menu_events);
     app.insert_non_send(platform_callbacks)
         .insert_non_send(overlay_manager)
-        .insert_non_send(OverviewRenderer::new(mtm))
+        .insert_non_send(OverviewRenderer::new(mtm, overview_events))
         .insert_non_send(flash_message_manager)
         .insert_non_send(menu_bar_manager)
         .insert_non_send(receiver);

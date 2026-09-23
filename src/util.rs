@@ -394,3 +394,33 @@ where
             .then(|| getter(screen))
     })
 }
+
+/// A bitmap context drawing into `data` as tightly packed 8-bit RGBA,
+/// premultiplied — the one pixel format overview thumbnails travel in, both
+/// when a capture is flattened to bytes and when the bytes become an image.
+///
+/// # Safety
+///
+/// `data` must point to at least `width * height * 4` writable bytes that
+/// outlive the returned context.
+pub unsafe fn rgba_bitmap_context(
+    data: *mut std::ffi::c_void,
+    width: usize,
+    height: usize,
+) -> Option<objc2_core_foundation::CFRetained<objc2_core_graphics::CGContext>> {
+    use objc2_core_graphics::{CGColorSpace, CGImageAlphaInfo, CGImageByteOrderInfo};
+
+    let space = CGColorSpace::new_device_rgb()?;
+    let info = CGImageAlphaInfo::PremultipliedLast.0 | CGImageByteOrderInfo::Order32Big.0;
+    unsafe {
+        objc2_core_graphics::CGBitmapContextCreate(
+            data,
+            width,
+            height,
+            8,
+            width.checked_mul(4)?,
+            Some(&space),
+            info,
+        )
+    }
+}

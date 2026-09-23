@@ -762,3 +762,35 @@ fn test_overview_refuses_to_open_during_mission_control() {
             Event::MissionControlShowAllWindows,
         ]);
 }
+
+// ── Thumbnails ─────────────────────────────────────────────────────────────
+
+#[test]
+fn test_overview_thumbnail_for_unknown_window_is_dropped() {
+    let thumbnail = |window_id| Event::OverviewThumbnail {
+        window_id,
+        width: 2,
+        height: 2,
+        rgba: vec![0; 16],
+    };
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(2, |world, _state| {
+            let overview = world.get_resource::<Overview>().expect("still open");
+            assert_eq!(overview.phase, OverviewPhase::Open);
+            assert_eq!(overview.layout.rows[0].tiles.len(), 2);
+        })
+        .on_iteration(3, |world, _state| {
+            assert!(
+                world.get_resource::<Overview>().is_none(),
+                "arrives after close"
+            );
+        })
+        .run(vec![
+            toggle(),
+            thumbnail(4242),
+            thumbnail(0),
+            toggle(),
+            thumbnail(0),
+        ]);
+}

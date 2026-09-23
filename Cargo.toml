@@ -56,8 +56,11 @@ pedantic = "warn"
 # `luajit-src` copies its sources out of the read-only Nix store and then
 # cannot write to the copy.
 [features]
-default = ["lua", "vendored"]
+default = ["lua", "vendored", "thumbnails"]
 vendored = ["mlua/vendored"]
+# Window thumbnails in the overview, via ScreenCaptureKit (macOS 14+, and the
+# Screen Recording permission at runtime). Without it tiles show icon + title.
+thumbnails = ["dep:objc2-screen-capture-kit", "dep:block2"]
 lua = [
   "lua-base",
   "luajit",
@@ -141,6 +144,19 @@ objc2-app-kit = { version = "0.3", features = [
 ] }
 objc2-core-foundation = { version = "0.3", features = ["CFRunLoop"] }
 objc2-core-graphics = "0.3"
+# The overview's thumbnails (`thumbnails` feature). No `dispatch2`: the
+# completion handlers run on ScreenCaptureKit's own queue, and nothing here
+# needs to name one.
+objc2-screen-capture-kit = { version = "0.3", default-features = false, optional = true, features = [
+  "std",
+  "block2",
+  "objc2-core-foundation",
+  "objc2-core-graphics",
+  "SCShareableContent",
+  "SCScreenshotManager",
+  "SCStream",
+] }
+block2 = { version = "0.6", optional = true }
 paneru-shared-types = { workspace = true }
 paneru-lua = { workspace = true, optional = true }
 objc2-quartz-core = { version = "0.3", features = [
