@@ -34,6 +34,10 @@ const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
 pub struct TierMemory {
     pub last_managed: Option<Entity>,
     pub last_floating: Option<Entity>,
+    /// niri's `activate_prev_column_on_removal`: the column `last_managed` was
+    /// tiled back beside. If `last_managed` floats again before another tiled
+    /// window is focused, this column becomes the active one again.
+    return_to: Option<Entity>,
 }
 
 /// Keyed by `WorkspaceId` so toggling on one Space can't reach a window last
@@ -55,9 +59,48 @@ impl FocusHistory {
     ) {
         let slot = self.by_workspace.entry(workspace).or_default();
         match unmanaged {
-            None => slot.last_managed = Some(entity),
+            None => {
+                // Re-recording the same window (the OS echoing focus) keeps
+                // the flag; any other tiled window taking focus drops it.
+                if slot.last_managed != Some(entity) {
+                    slot.return_to = None;
+                }
+                slot.last_managed = Some(entity);
+            }
             Some(Unmanaged::Floating) => slot.last_floating = Some(entity),
             Some(_) => {}
+        }
+    }
+
+    /// `entity` was tiled back as a new column right of `anchor` and has focus:
+    /// it becomes the active column, and floating it again returns to `anchor`.
+    pub fn tiled_beside(&mut self, workspace: WorkspaceId, entity: Entity, anchor: Option<Entity>) {
+        let slot = self.by_workspace.entry(workspace).or_default();
+        slot.last_managed = Some(entity);
+        slot.return_to = anchor;
+    }
+
+    /// `entity` left the strip of `workspace` by floating. If it was the active
+    /// column, the role goes to the column it was tiled back beside (when that
+    /// is `still_there`), otherwise to `successor`.
+    pub fn hand_off(
+        &mut self,
+        workspace: WorkspaceId,
+        entity: Entity,
+        still_there: impl Fn(Entity) -> bool,
+        successor: Option<Entity>,
+    ) {
+        let Some(slot) = self.by_workspace.get_mut(&workspace) else {
+            return;
+        };
+        if slot.last_managed == Some(entity) {
+            slot.last_managed = slot
+                .return_to
+                .take()
+                .filter(|column| still_there(*column))
+                .or(successor);
+        } else if slot.return_to == Some(entity) {
+            slot.return_to = None;
         }
     }
 
@@ -80,6 +123,10 @@ impl FocusHistory {
         for slot in self.by_workspace.values_mut() {
             if slot.last_managed == Some(entity) {
                 slot.last_managed = None;
+                slot.return_to = None;
+            }
+            if slot.return_to == Some(entity) {
+                slot.return_to = None;
             }
             if slot.last_floating == Some(entity) {
                 slot.last_floating = None;
@@ -561,6 +608,130 @@ mod tests {
         assert_eq!(history.last_managed(1), None);
         assert_eq!(history.last_floating(2), None);
         assert_eq!(history.last_managed(2), Some(other));
+    }
+
+    fn return_to(history: &FocusHistory, workspace: WorkspaceId) -> Option<Entity> {
+        history
+            .by_workspace
+            .get(&workspace)
+            .and_then(|slot| slot.return_to)
+    }
+
+    #[test]
+    fn tiled_beside_activates_the_window_and_remembers_the_anchor() {
+        let mut world = World::new();
+        let window = world.spawn(()).id();
+        let anchor = world.spawn(()).id();
+        let mut history = FocusHistory::default();
+
+        history.tiled_beside(1, window, Some(anchor));
+
+        assert_eq!(history.last_managed(1), Some(window));
+        assert_eq!(return_to(&history, 1), Some(anchor));
+    }
+
+    #[test]
+    fn record_clears_return_to_only_when_another_tiled_window_takes_focus() {
+        let mut world = World::new();
+        let window = world.spawn(()).id();
+        let anchor = world.spawn(()).id();
+        let other = world.spawn(()).id();
+        let mut history = FocusHistory::default();
+        history.tiled_beside(1, window, Some(anchor));
+
+        history.record(1, window, None);
+        history.record(1, other, Some(&Unmanaged::Floating));
+        assert_eq!(return_to(&history, 1), Some(anchor));
+
+        history.record(1, other, None);
+        assert_eq!(return_to(&history, 1), None);
+    }
+
+    #[test]
+    fn hand_off_returns_to_the_anchor_when_flagged() {
+        let mut world = World::new();
+        let window = world.spawn(()).id();
+        let anchor = world.spawn(()).id();
+        let successor = world.spawn(()).id();
+        let mut history = FocusHistory::default();
+        history.tiled_beside(1, window, Some(anchor));
+
+        history.hand_off(1, window, |_| true, Some(successor));
+
+        assert_eq!(history.last_managed(1), Some(anchor));
+        assert_eq!(return_to(&history, 1), None);
+    }
+
+    #[test]
+    fn hand_off_goes_to_the_successor_without_a_flag() {
+        let mut world = World::new();
+        let window = world.spawn(()).id();
+        let successor = world.spawn(()).id();
+        let mut history = FocusHistory::default();
+        history.record(1, window, None);
+
+        history.hand_off(1, window, |_| true, Some(successor));
+
+        assert_eq!(history.last_managed(1), Some(successor));
+    }
+
+    #[test]
+    fn hand_off_skips_a_stale_anchor() {
+        let mut world = World::new();
+        let window = world.spawn(()).id();
+        let anchor = world.spawn(()).id();
+        let successor = world.spawn(()).id();
+        let mut history = FocusHistory::default();
+        history.tiled_beside(1, window, Some(anchor));
+
+        history.hand_off(1, window, |column| column != anchor, Some(successor));
+
+        assert_eq!(history.last_managed(1), Some(successor));
+        assert_eq!(return_to(&history, 1), None);
+    }
+
+    #[test]
+    fn hand_off_of_the_anchor_clears_the_flag() {
+        let mut world = World::new();
+        let window = world.spawn(()).id();
+        let anchor = world.spawn(()).id();
+        let successor = world.spawn(()).id();
+        let mut history = FocusHistory::default();
+        history.tiled_beside(1, window, Some(anchor));
+
+        history.hand_off(1, anchor, |_| true, Some(successor));
+
+        assert_eq!(history.last_managed(1), Some(window));
+        assert_eq!(return_to(&history, 1), None);
+    }
+
+    #[test]
+    fn hand_off_on_an_unknown_space_is_a_no_op() {
+        let mut world = World::new();
+        let window = world.spawn(()).id();
+        let mut history = FocusHistory::default();
+
+        history.hand_off(1, window, |_| true, Some(window));
+
+        assert!(history.by_workspace.is_empty());
+    }
+
+    #[test]
+    fn forget_clears_return_to() {
+        let mut world = World::new();
+        let window = world.spawn(()).id();
+        let anchor = world.spawn(()).id();
+        let mut history = FocusHistory::default();
+
+        history.tiled_beside(1, window, Some(anchor));
+        history.forget(anchor);
+        assert_eq!(history.last_managed(1), Some(window));
+        assert_eq!(return_to(&history, 1), None);
+
+        history.tiled_beside(1, window, Some(anchor));
+        history.forget(window);
+        assert_eq!(history.last_managed(1), None);
+        assert_eq!(return_to(&history, 1), None);
     }
 
     #[test]
