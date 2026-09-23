@@ -152,7 +152,8 @@ pub fn initialise_workspaces(
     mut commands: Commands,
 ) {
     let wanted = config.default_workspaces();
-    if wanted <= 1 {
+    // Dynamic workspaces keep exactly one spare row; pre-created ones would be reaped.
+    if config.dynamic_workspaces() || wanted <= 1 {
         return;
     }
 

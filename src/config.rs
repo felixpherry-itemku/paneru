@@ -891,6 +891,13 @@ impl Config {
             .create_virtual_workspace_automatically
             .is_some_and(|enabled| enabled)
     }
+
+    pub fn dynamic_workspaces(&self) -> bool {
+        // Default is disabled.
+        self.options()
+            .dynamic_workspaces
+            .is_some_and(|enabled| enabled)
+    }
     pub fn menubar_orientation(&self) -> MenubarOrientation {
         self.inner()
             .decorations
@@ -1314,6 +1321,14 @@ pub struct MainOptions {
     /// If a non-enumerated (e.g. South) gesture or window movement would target a nonexistent
     /// virtual workspace, create the workspace automatically.
     pub create_virtual_workspace_automatically: Option<bool>,
+
+    /// niri-style dynamic virtual workspaces: each space numbers its rows 1..N
+    /// without gaps, an empty row is removed once no display shows it, and one
+    /// empty row always follows the last occupied one. Overrides
+    /// `reap_empty_workspaces`, `create_virtual_workspace_automatically` and
+    /// `default_workspaces`.
+    /// Default: false.
+    pub dynamic_workspaces: Option<bool>,
 }
 
 /// Returns a default set of column widths.
@@ -2201,6 +2216,15 @@ fn test_default_workspaces() {
     // Zero is clamped up to 1 (the physical space always exists).
     let config = Config::try_from(&*format!("default_workspaces = 0\n{base}")).unwrap();
     assert_eq!(config.default_workspaces(), 1);
+}
+
+#[test]
+fn test_dynamic_workspaces() {
+    let config = Config::try_from("[options]\n[bindings]\n").unwrap();
+    assert!(!config.dynamic_workspaces());
+
+    let config = Config::try_from("[options]\ndynamic_workspaces = true\n[bindings]\n").unwrap();
+    assert!(config.dynamic_workspaces());
 }
 
 #[test]

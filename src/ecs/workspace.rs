@@ -83,7 +83,9 @@ impl Plugin for WorkspaceEventsPlugin {
         const DISPLAY_CHANGE_CHECK_FREQ: Duration = Duration::from_millis(1000);
 
         let reap_workspaces = |config: Option<Res<Config>>| {
-            config.is_some_and(|config| config.reap_empty_workspaces())
+            config.is_some_and(|config| {
+                config.reap_empty_workspaces() && !config.dynamic_workspaces()
+            })
         };
 
         app.add_systems(
