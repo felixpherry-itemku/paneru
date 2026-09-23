@@ -11,6 +11,9 @@ use objc2_foundation::{
     NSAttributedString, NSDictionary, NSMutableCopying, NSPoint, NSRect, NSSize, NSString,
 };
 
+mod overview_window;
+pub use overview_window::*;
+
 #[derive(Clone, PartialEq)]
 pub struct BorderParams {
     pub color: (f64, f64, f64),

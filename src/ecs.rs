@@ -37,7 +37,7 @@ use crate::manager::{
     Application, Origin, ProcessApi, Size, Window, WindowManager, WindowManagerApi, WindowManagerOS,
 };
 use crate::menubar::MenuBarManager;
-use crate::overlay::{FlashMessageManager, OverlayManager};
+use crate::overlay::{FlashMessageManager, OverlayManager, OverviewRenderer};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 
 pub mod display;
@@ -720,6 +720,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     let menu_bar_manager = MenuBarManager::new(mtm, menu_events);
     app.insert_non_send(platform_callbacks)
         .insert_non_send(overlay_manager)
+        .insert_non_send(OverviewRenderer::new(mtm))
         .insert_non_send(flash_message_manager)
         .insert_non_send(menu_bar_manager)
         .insert_non_send(receiver);

@@ -17,7 +17,9 @@ use crate::{
     ecs::{
         ActiveWorkspaceMarker, Bounds, DockPosition, FlashMessage, FocusedMarker, FullWidthMarker,
         Initializing, LayoutPosition, NativeFullscreenMarker, Position, RepositionMarker,
-        ResizeMarker, Scrolling, Unmanaged, WidthRatio, layout::LayoutStrip,
+        ResizeMarker, Scrolling, Unmanaged, WidthRatio,
+        layout::LayoutStrip,
+        overview::{Overview, OverviewPhase},
     },
     manager::{Application, Display, Origin, Size, Window},
     platform::{ProcessSerialNumber, WinID},
@@ -205,16 +207,22 @@ pub struct FrameActivity<'w, 's> {
     resizing: Query<'w, 's, (), With<ResizeMarker>>,
     scrolling: Query<'w, 's, (), With<Scrolling>>,
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
+    overview: Option<Res<'w, Overview>>,
 }
 
 impl FrameActivity<'_, '_> {
-    /// Returns `true` while any window is being moved, resized or scrolled, or
-    /// a flash message is on screen — i.e. while frames still need drawing.
+    /// Returns `true` while any window is being moved, resized or scrolled, a
+    /// flash message is on screen, or the overview is zooming in or out — i.e.
+    /// while frames still need drawing. A settled overview is static.
     pub fn mid_frame(&self) -> bool {
         !self.repositioning.is_empty()
             || !self.resizing.is_empty()
             || !self.scrolling.is_empty()
             || !self.flash_messages.is_empty()
+            || self
+                .overview
+                .as_ref()
+                .is_some_and(|overview| overview.phase != OverviewPhase::Open)
     }
 }
 

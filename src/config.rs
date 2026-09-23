@@ -2413,14 +2413,15 @@ missing_windows = "ignore"
 }
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn test_overview_config_defaults() {
     let config = Config::try_from(
-        r#"
+        r"
 [options]
 animation_speed = 12.0
 
 [bindings]
-"#,
+",
     )
     .expect("config should parse");
 
@@ -2433,9 +2434,10 @@ animation_speed = 12.0
 }
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn test_overview_config_explicit_values() {
     let config = Config::try_from(
-        r#"
+        r"
 [options]
 animation_speed = 12.0
 
@@ -2448,7 +2450,7 @@ label_height = 0
 thumbnails = false
 
 [bindings]
-"#,
+",
     )
     .expect("config should parse");
 

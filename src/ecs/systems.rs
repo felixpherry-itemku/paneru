@@ -565,7 +565,7 @@ pub(super) fn retry_front_switch(
     clippy::cast_possible_truncation,
     reason = "clamped to [0, 1], well within f32's range; only sub-pixel precision is lost"
 )]
-fn ease_out_factor(rate: f64, delta: f64) -> f32 {
+pub(crate) fn ease_out_factor(rate: f64, delta: f64) -> f32 {
     (1.0 - (-rate * delta).exp()).clamp(0.0, 1.0) as f32
 }
 

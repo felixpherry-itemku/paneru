@@ -13,8 +13,9 @@ use bevy::ecs::query::{Changed, Has};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::resource_exists;
-use bevy::ecs::system::{Commands, Query, Res, ResMut};
+use bevy::ecs::system::{Commands, NonSendMut, Query, Res, ResMut};
 use bevy::math::{IRect, IVec2};
+use bevy::time::Time;
 use tracing::{Level, instrument};
 
 use crate::commands::Command;
@@ -22,12 +23,17 @@ use crate::config::Config;
 use crate::ecs::ActiveWorkspaceMarker;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, Windows};
+use crate::ecs::systems::ease_out_factor;
 use crate::events::Event;
 use crate::manager::Window;
+use crate::overlay::{OverviewRenderer, OverviewScene, SceneRow, SceneTile};
 use crate::platform::input::set_overview_active;
 
 /// Escape. Always closes, so a swallowed keyboard can never get stuck.
 const KEY_ESCAPE: u8 = 53;
+
+/// How close `progress` must get to its goal before it snaps there.
+const PROGRESS_EPSILON: f32 = 0.001;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OverviewPhase {
@@ -137,7 +143,7 @@ impl From<&Config> for OverviewConfig {
 pub fn project<F>(
     rows: &[(Entity, &LayoutStrip, bool)],
     viewport: IRect,
-    config: &OverviewConfig,
+    config: OverviewConfig,
     frame_of: &F,
 ) -> OverviewLayout
 where
@@ -236,6 +242,17 @@ where
     tiles.into_iter().map(|(_, tile)| tile).collect()
 }
 
+/// One ease-out step of `progress` towards `goal`, snapping onto it once
+/// within [`PROGRESS_EPSILON`] so the animation ends on exactly 0.0 or 1.0.
+pub fn step_progress(progress: f32, goal: f32, t: f32) -> f32 {
+    let next = progress + (goal - progress) * t;
+    if (goal - next).abs() < PROGRESS_EPSILON {
+        goal
+    } else {
+        next
+    }
+}
+
 pub struct OverviewPlugin;
 
 impl Plugin for OverviewPlugin {
@@ -243,19 +260,23 @@ impl Plugin for OverviewPlugin {
         app.add_systems(PreUpdate, overview_toggle);
         app.add_systems(
             PostUpdate,
-            overview_project.run_if(resource_exists::<Overview>),
+            // Per system, not once for the set: `overview_animate` can remove
+            // the resource, and `overview_render` must then not run.
+            (overview_project, overview_animate, overview_render)
+                .chain()
+                .distributive_run_if(resource_exists::<Overview>),
         );
     }
 }
 
-/// Opens the overview on `Command::Overview` and closes it on a second one.
+/// Opens the overview on `Command::Overview`; a second one starts it closing.
 ///
 /// While open the event tap swallows the `overview` chord too, so it arrives as
 /// an [`Event::OverviewKey`]; that — or Escape — closes it as well.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn overview_toggle(
     mut messages: MessageReader<Event>,
-    overview: Option<Res<Overview>>,
+    overview: Option<ResMut<Overview>>,
     config: Option<Res<Config>>,
     mut commands: Commands,
 ) {
@@ -281,9 +302,11 @@ fn overview_toggle(
         return;
     }
 
-    if overview.is_some() {
-        commands.remove_resource::<Overview>();
-        set_overview_active(false);
+    if let Some(mut overview) = overview {
+        // Already on its way out: nothing more to do.
+        if !matches!(overview.phase, OverviewPhase::Closing { .. }) {
+            overview.phase = OverviewPhase::Closing { activate: None };
+        }
     } else {
         commands.insert_resource(Overview::opening());
         set_overview_active(true);
@@ -315,7 +338,110 @@ fn overview_project(
     overview.layout = project(
         &rows,
         active_display.actual_bounds(&config),
-        &OverviewConfig::from(config.as_ref()),
+        OverviewConfig::from(config.as_ref()),
         &|entity| windows.moving_frame(entity),
     );
+}
+
+/// Hands the renderer a fresh scene whenever the overview changed: every frame
+/// of the animation, and on projection or selection changes once settled.
+#[instrument(level = Level::DEBUG, skip_all)]
+fn overview_render(
+    overview: Res<Overview>,
+    active_display: ActiveDisplay,
+    windows: Windows,
+    config: Res<Config>,
+    renderer: Option<NonSendMut<OverviewRenderer>>,
+) {
+    let Some(mut renderer) = renderer else {
+        return;
+    };
+    if !overview.is_changed() {
+        return;
+    }
+
+    let display = active_display.display();
+    let mut bounds = display.bounds();
+    bounds.min.y -= display.menubar_height();
+
+    let rows = overview
+        .layout
+        .rows
+        .iter()
+        .map(|row| SceneRow {
+            band: row.band,
+            label: (row.virtual_index + 1).to_string(),
+            is_active: row.is_active,
+        })
+        .collect();
+    let tiles = overview
+        .layout
+        .rows
+        .iter()
+        .flat_map(|row| &row.tiles)
+        .map(|tile| {
+            let window = windows.get(tile.entity);
+            SceneTile {
+                pid: window
+                    .and_then(|window| window.pid().ok())
+                    .unwrap_or_default(),
+                frame: tile.frame_at(overview.progress),
+                title: window
+                    .and_then(|window| window.title().ok())
+                    .unwrap_or_default(),
+                tab_count: tile.tab_count,
+                selected: overview.selected == Some(tile.entity),
+            }
+        })
+        .collect();
+
+    renderer.render(OverviewScene {
+        display: bounds,
+        progress: overview.progress,
+        scrim_opacity: config.overview_scrim_opacity(),
+        scrim_color: config.overview_scrim_color(),
+        label_height: config.overview_label_height(),
+        rows,
+        tiles,
+    });
+}
+
+/// Drives `progress` towards 1.0 while opening and 0.0 while closing. A
+/// settled, open overview is left untouched so nothing downstream sees a change.
+#[instrument(level = Level::DEBUG, skip_all)]
+fn overview_animate(
+    mut overview: ResMut<Overview>,
+    time: Res<Time>,
+    config: Res<Config>,
+    renderer: Option<NonSendMut<OverviewRenderer>>,
+    mut commands: Commands,
+) {
+    let goal = match overview.phase {
+        OverviewPhase::Open => return,
+        OverviewPhase::Opening => 1.0,
+        OverviewPhase::Closing { .. } => 0.0,
+    };
+    let t = ease_out_factor(config.overview_animation_speed(), time.delta_secs_f64());
+    overview.progress = step_progress(overview.progress, goal, t);
+
+    match overview.phase {
+        OverviewPhase::Opening if overview.progress >= 1.0 => {
+            overview.phase = OverviewPhase::Open;
+        }
+        OverviewPhase::Closing { .. } if overview.progress <= 0.0 => {
+            finish_close(&mut commands, renderer);
+        }
+        _ => {}
+    }
+}
+
+/// The single exit from the overview: gives the keyboard back, takes the
+/// window down and drops the resource, which also unschedules every overview
+/// system.
+fn finish_close(commands: &mut Commands, renderer: Option<NonSendMut<OverviewRenderer>>) {
+    set_overview_active(false);
+    if let Some(mut renderer) = renderer {
+        renderer.close();
+    }
+    commands.remove_resource::<Overview>();
 }
