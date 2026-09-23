@@ -8,14 +8,15 @@ use objc2_core_foundation::CGPoint;
 
 use crate::assert_focused;
 use crate::commands::{Command, Direction, MoveFocus, Operation};
-use crate::ecs::ActiveWorkspaceMarker;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::overview::{
-    KeyAction, Overview, OverviewConfig, OverviewLayout, OverviewPhase, OverviewTile,
-    initial_selection, key_action, move_selection, project, step_progress,
+    KeyAction, Overview, OverviewConfig, OverviewLayout, OverviewPhase, OverviewTile, key_action,
+    project, step_progress,
 };
 use crate::ecs::params::FrameActivity;
+use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SpawnWindowTrigger};
 use crate::events::Event;
+use crate::manager::Display;
 use crate::platform::Modifiers;
 
 use super::*;
@@ -361,6 +362,8 @@ fn test_overview_mid_frame_only_while_animating() {
                 selected: None,
                 hovered: None,
                 layout: OverviewLayout::default(),
+                display: 0,
+                reproject: false,
             });
         }
         let mut state = SystemState::<FrameActivity>::new(&mut world);
@@ -401,7 +404,7 @@ fn test_overview_keys_follow_lua_binds() {
     ];
     assert_eq!(
         key_action(KEY_O, Modifiers::ALT, None, &binds),
-        Some(KeyAction::Dismiss)
+        Some(KeyAction::Close)
     );
     assert_eq!(
         key_action(KEY_H, Modifiers::ALT, None, &binds),
@@ -421,12 +424,11 @@ fn test_overview_keys_follow_lua_binds() {
     assert_eq!(key_action(KEY_H, Modifiers::empty(), None, &binds), None);
 }
 
-// ── Selection and activation (harness) ─────────────────────────────────────
+// ── Live focus (harness) ───────────────────────────────────────────────────
 
 const KEY_RETURN: u8 = 36;
 const KEY_DOWN: u8 = 125;
 const KEY_RIGHT: u8 = 124;
-const KEY_LEFT: u8 = 123;
 
 fn key(keycode: u8) -> Event {
     Event::OverviewKey {
@@ -472,19 +474,75 @@ fn focused_entity(world: &mut World) -> Option<Entity> {
     query.single(world).ok()
 }
 
-/// Sends windows 0 and 1 to VW1 (focus ends on window 2, alone on VW0), opens
-/// the overview, drops the cursor into VW1, pushes it `sideways` to one end of
-/// the row and commits. Activating either end of a two-window row means one of
-/// the two runs picks a window other than the row's remembered focus, which
-/// `show_active_workspace` would restore if it won the race.
-fn activate_row_end(sideways: u8, pick: fn(&[Entity]) -> Entity) {
+fn selected(world: &World) -> Option<Entity> {
+    world
+        .get_resource::<Overview>()
+        .expect("overview open")
+        .selected
+}
+
+#[test]
+fn test_overview_swap_while_open_keeps_the_window_selected() {
     TestHarness::new()
         .with_windows(3)
-        .on_iteration(6, move |world, _state| {
+        .on_iteration(2, |world, _state| {
+            let (w0, w1) = (find_window_entity(0, world), find_window_entity(1, world));
+            assert_eq!(
+                row_windows(world, 0)[..2],
+                [w1, w0],
+                "swapped behind the overview"
+            );
+            assert_focused!(world, 0);
+            assert_eq!(selected(world), Some(w0));
+            let overview = world.get_resource::<Overview>().expect("still open");
+            let x = |entity| overview.layout.find(entity).expect("tile").1.target.min.x;
+            assert!(x(w1) < x(w0), "tiles re-projected in the new order");
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            toggle(),
+            Event::Command {
+                command: Command::Window(Operation::Swap(Direction::East)),
+            },
+        ]);
+}
+
+#[test]
+fn test_overview_arrow_moves_real_focus_while_open() {
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(2, |world, _state| {
+            assert!(world.get_resource::<Overview>().is_some(), "still open");
+            assert_focused!(world, 1);
+            let w1 = find_window_entity(1, world);
+            assert_eq!(selected(world), Some(w1));
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            toggle(),
+            key(KEY_RIGHT),
+        ]);
+}
+
+/// Windows 0 and 1 go to VW1, leaving window 2 alone and focused on VW0. Down
+/// from a lone column switches the workspace behind the open overview.
+#[test]
+fn test_overview_arrow_down_switches_workspace_while_open() {
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(4, |world, _state| {
+            assert!(world.get_resource::<Overview>().is_some(), "still open");
+            assert_eq!(active_virtual_index(world), 1);
+            let row = row_windows(world, 1);
+            let selected = selected(world).expect("a selection");
+            assert!(row.contains(&selected), "selection on the VW1 row");
+            assert_eq!(Some(selected), focused_entity(world));
+        })
+        .on_iteration(5, |world, _state| {
             assert!(world.get_resource::<Overview>().is_none(), "closed");
-            assert_eq!(active_virtual_index(world), 1, "switched to VW1");
-            let expected = pick(&row_windows(world, 1));
-            assert_eq!(focused_entity(world), Some(expected));
+            assert_eq!(active_virtual_index(world), 1, "stays on VW1");
+            let row = row_windows(world, 1);
+            assert!(focused_entity(world).is_some_and(|focused| row.contains(&focused)));
         })
         .run(vec![
             Event::MenuOpened { window_id: 0 },
@@ -492,157 +550,73 @@ fn activate_row_end(sideways: u8, pick: fn(&[Entity]) -> Entity) {
             send_window_down(),
             toggle(),
             key(KEY_DOWN),
-            key(sideways),
             key(KEY_RETURN),
         ]);
 }
 
 #[test]
-fn test_overview_enter_activates_left_window_on_another_row() {
-    activate_row_end(KEY_LEFT, |row| row[0]);
+fn test_overview_projects_a_window_spawned_while_open() {
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(1, |world, state| {
+            let frame = IRect::new(0, 0, TEST_WINDOW_WIDTH, TEST_WINDOW_HEIGHT);
+            let window = state.spawn_window(TEST_PROCESS_ID, TEST_WORKSPACE_ID, 2, frame);
+            world.trigger(SpawnWindowTrigger(vec![window]));
+            state.focus_window(2);
+        })
+        .on_iteration(2, |world, _state| {
+            let spawned = find_window_entity(2, world);
+            let overview = world.get_resource::<Overview>().expect("still open");
+            assert!(overview.layout.find(spawned).is_some(), "projected");
+            assert_eq!(overview.selected, Some(spawned), "selected once focused");
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            toggle(),
+            Event::MenuOpened { window_id: 0 },
+        ]);
 }
 
 #[test]
-fn test_overview_enter_activates_right_window_on_another_row() {
-    activate_row_end(KEY_RIGHT, |row| row[row.len() - 1]);
+fn test_overview_closes_when_the_active_display_changes() {
+    TestHarness::new()
+        .with_windows(1)
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .on_iteration(1, |world, _state| {
+            assert!(world.get_resource::<Overview>().is_some(), "open");
+            // The harness has no real display switch, so move the marker.
+            let mut query =
+                world.query::<(Entity, &Display, bevy::ecs::query::Has<ActiveDisplayMarker>)>();
+            let displays = query
+                .iter(world)
+                .map(|(entity, display, active)| (entity, display.id(), active))
+                .collect::<Vec<_>>();
+            for (entity, id, active) in displays {
+                if active {
+                    world.entity_mut(entity).remove::<ActiveDisplayMarker>();
+                } else if id == EXT_DISPLAY_ID {
+                    world.entity_mut(entity).insert(ActiveDisplayMarker);
+                }
+            }
+        })
+        .on_iteration(2, |world, _state| {
+            assert!(
+                world.get_resource::<Overview>().is_none(),
+                "another display became active"
+            );
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            toggle(),
+            Event::MenuOpened { window_id: 0 },
+        ]);
 }
 
-// ── Selection (pure) ───────────────────────────────────────────────────────
-
-/// Projects `strips` as rows, row 0 active, pairing each with its own entity.
-fn rows_of(strips: &[LayoutStrip]) -> (OverviewLayout, Vec<(Entity, &LayoutStrip)>) {
-    let ids = entities(strips.len());
-    let paired = ids.iter().copied().zip(strips).collect::<Vec<_>>();
-    let rows = paired
-        .iter()
-        .enumerate()
-        .map(|(index, (entity, strip))| (*entity, *strip, index == 0))
-        .collect::<Vec<_>>();
-    (project(&rows, VIEWPORT, NO_GAPS, &unit_frame), paired)
-}
-
-fn strip_of(virtual_index: u32, columns: &[&[Entity]]) -> LayoutStrip {
-    let mut strip = LayoutStrip::new(1, virtual_index);
-    for column in columns {
-        strip.append(column[0]);
-        for &below in &column[1..] {
-            strip.append(below);
-            strip
-                .stack(below)
-                .expect("stack onto the column to the left");
-        }
-    }
-    strip
-}
-
-#[test]
-fn test_overview_cursor_east_from_last_column_stays_put() {
-    let wins = entities(2);
-    let strips = [strip_of(0, &[&[wins[0]], &[wins[1]]])];
-    let (layout, strips) = rows_of(&strips);
-
-    assert_eq!(
-        move_selection(&layout, &strips, wins[1], &Direction::East),
-        wins[1]
-    );
-    assert_eq!(
-        move_selection(&layout, &strips, wins[0], &Direction::East),
-        wins[1]
-    );
-}
-
-#[test]
-fn test_overview_cursor_south_mid_stack_moves_down_the_column() {
-    let wins = entities(4);
-    let strips = [strip_of(0, &[&[wins[0]], &[wins[1], wins[2], wins[3]]])];
-    let (layout, strips) = rows_of(&strips);
-
-    assert_eq!(
-        move_selection(&layout, &strips, wins[1], &Direction::South),
-        wins[2]
-    );
-    assert_eq!(
-        move_selection(&layout, &strips, wins[2], &Direction::North),
-        wins[1]
-    );
-}
-
-#[test]
-fn test_overview_cursor_south_at_stack_bottom_falls_to_nearest_column_below() {
-    let wins = entities(5);
-    let strips = [
-        strip_of(0, &[&[wins[0]], &[wins[1], wins[2]]]),
-        strip_of(1, &[&[wins[3]], &[wins[4]]]),
-    ];
-    let (layout, strips) = rows_of(&strips);
-
-    assert_eq!(
-        move_selection(&layout, &strips, wins[2], &Direction::South),
-        wins[4],
-        "right-hand column lands on the right-hand column below"
-    );
-    assert_eq!(
-        move_selection(&layout, &strips, wins[0], &Direction::South),
-        wins[3]
-    );
-}
-
-#[test]
-fn test_overview_cursor_south_on_bottom_row_stays_put() {
-    let wins = entities(2);
-    let strips = [strip_of(0, &[&[wins[0]]]), strip_of(1, &[&[wins[1]]])];
-    let (layout, strips) = rows_of(&strips);
-
-    assert_eq!(
-        move_selection(&layout, &strips, wins[1], &Direction::South),
-        wins[1]
-    );
-    assert_eq!(
-        move_selection(&layout, &strips, wins[0], &Direction::North),
-        wins[0],
-        "no wrap at the top either"
-    );
-}
-
-#[test]
-fn test_overview_cursor_on_single_column_falls_through_immediately() {
-    let wins = entities(2);
-    let strips = [
-        strip_of(0, &[&[wins[0]]]),
-        LayoutStrip::new(1, 1),
-        strip_of(2, &[&[wins[1]]]),
-    ];
-    let (layout, strips) = rows_of(&strips);
-
-    assert_eq!(
-        move_selection(&layout, &strips, wins[0], &Direction::South),
-        wins[1],
-        "skips the empty row"
-    );
-    assert_eq!(
-        move_selection(&layout, &strips, wins[1], &Direction::North),
-        wins[0]
-    );
-}
-
-#[test]
-fn test_overview_initial_selection_prefers_focus_then_active_row() {
-    let wins = entities(3);
-    let strips = [
-        strip_of(0, &[&[wins[0]], &[wins[1]]]),
-        strip_of(1, &[&[wins[2]]]),
-    ];
-    let (layout, _) = rows_of(&strips);
-
-    assert_eq!(initial_selection(&layout, Some(wins[2])), Some(wins[2]));
-    assert_eq!(initial_selection(&layout, None), Some(wins[0]));
-    assert_eq!(
-        initial_selection(&OverviewLayout::default(), Some(wins[2])),
-        None
-    );
-}
-
-// ── Selection and activation (more harness) ────────────────────────────────
+// ── Closing (harness) ──────────────────────────────────────────────────────
 
 fn strip_snapshot(world: &mut World) -> Vec<String> {
     let mut query = world.query::<(&LayoutStrip, bevy::ecs::query::Has<ActiveWorkspaceMarker>)>();
@@ -667,7 +641,7 @@ fn test_overview_escape_leaves_focus_and_layout_untouched() {
             *recorded.borrow_mut() = strip_snapshot(world);
             assert_focused!(world, 0);
         })
-        .on_iteration(3, move |world, _state| {
+        .on_iteration(2, move |world, _state| {
             assert!(world.get_resource::<Overview>().is_none(), "closed");
             assert_focused!(world, 0);
             assert_eq!(strip_snapshot(world), *before.borrow());
@@ -675,45 +649,22 @@ fn test_overview_escape_leaves_focus_and_layout_untouched() {
         .run(vec![
             Event::MenuOpened { window_id: 0 },
             toggle(),
-            key(KEY_RIGHT),
             key(KEY_ESCAPE),
         ]);
 }
 
 #[test]
-fn test_overview_enter_in_active_row_moves_focus_without_switching() {
-    TestHarness::new()
-        .with_windows(3)
-        .on_iteration(3, |world, _state| {
-            assert!(world.get_resource::<Overview>().is_none(), "closed");
-            assert_eq!(active_virtual_index(world), 0);
-            assert_focused!(world, 1);
-        })
-        .run(vec![
-            Event::MenuOpened { window_id: 0 },
-            toggle(),
-            key(KEY_RIGHT),
-            key(KEY_RETURN),
-        ]);
-}
-
-#[test]
-fn test_overview_destroyed_selection_moves_to_a_live_tile() {
+fn test_overview_closing_the_focused_window_selects_the_new_focus() {
     TestHarness::new()
         .with_windows(3)
         .on_iteration(1, |world, state| {
             let focused = find_window_entity(0, world);
-            let overview = world.get_resource::<Overview>().expect("overview open");
-            assert_eq!(overview.selected, Some(focused));
+            assert_eq!(selected(world), Some(focused));
             state.os_close_window(0);
         })
         .on_iteration(2, |world, _state| {
+            let focused = focused_entity(world);
             let overview = world.get_resource::<Overview>().expect("still open");
-            let selected = overview.selected.expect("a selection");
-            assert!(
-                overview.layout.find(selected).is_some(),
-                "selection is a live tile"
-            );
             let tiles = overview
                 .layout
                 .rows
@@ -721,6 +672,7 @@ fn test_overview_destroyed_selection_moves_to_a_live_tile() {
                 .map(|row| row.tiles.len())
                 .sum::<usize>();
             assert_eq!(tiles, 2, "the closed window's tile is gone");
+            assert_eq!(overview.selected, focused, "the selection is the focus");
         })
         .run(vec![
             Event::MenuOpened { window_id: 0 },

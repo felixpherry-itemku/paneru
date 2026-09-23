@@ -1,5 +1,6 @@
-//! The overview: a modal, zoomed-out map of every virtual workspace row on the
-//! active display. Selection is deferred — nothing moves until the user commits.
+//! The overview: a zoomed-out map of every virtual workspace row on the active
+//! display. The selection is the real focus: moves run as ordinary focus
+//! commands on the live layout behind it, and it re-projects to follow.
 //!
 //! The `Overview` resource exists exactly while the overview is on screen, and
 //! every system here is gated on it so nothing is scheduled while it is shut.
@@ -9,7 +10,7 @@ use bevy::ecs::change_detection::DetectChanges;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::message::MessageReader;
-use bevy::ecs::query::{Changed, Has};
+use bevy::ecs::query::{Changed, Has, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::resource_exists;
@@ -17,16 +18,20 @@ use bevy::ecs::system::{Commands, NonSendMut, Query, Res, ResMut};
 use bevy::math::{IRect, IVec2};
 use bevy::time::Time;
 use objc2_core_foundation::CGPoint;
+use objc2_core_graphics::CGDirectDisplayID;
 use tracing::{Level, instrument};
 
-use crate::commands::{Command, Direction, Operation, get_window_in_direction};
+use crate::commands::{Command, Direction, Operation};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::systems::ease_out_factor;
-use crate::ecs::{ActiveWorkspaceMarker, MissionControlActive, SpawnCommandsExt};
+use crate::ecs::{
+    ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, MissionControlActive,
+    SendMessageTrigger, SpawnCommandsExt,
+};
 use crate::events::Event;
-use crate::manager::Window;
+use crate::manager::{Display, Window};
 use crate::overlay::{OverviewRenderer, OverviewScene, SceneRow, SceneTile};
 use crate::platform::Modifiers;
 use crate::platform::input::{LuaKeybind, lua_keybinds, set_overview_active};
@@ -40,13 +45,12 @@ const KEY_RIGHT: u8 = 124;
 const KEY_DOWN: u8 = 125;
 const KEY_UP: u8 = 126;
 
-/// What an input does while the overview is open.
+/// What a key does while the overview is open.
 #[derive(Debug, PartialEq)]
 pub(crate) enum KeyAction {
-    /// Close, activating nothing.
-    Dismiss,
-    /// Close, activating the selection.
-    Activate,
+    /// Close, leaving focus where it is.
+    Close,
+    /// Move real focus, which the overview then follows.
     Move(Direction),
 }
 
@@ -59,8 +63,7 @@ pub(crate) fn key_action(
     lua_binds: &[LuaKeybind],
 ) -> Option<KeyAction> {
     match keycode {
-        KEY_ESCAPE => return Some(KeyAction::Dismiss),
-        KEY_RETURN | KEY_KEYPAD_ENTER => return Some(KeyAction::Activate),
+        KEY_ESCAPE | KEY_RETURN | KEY_KEYPAD_ENTER => return Some(KeyAction::Close),
         KEY_LEFT => return Some(KeyAction::Move(Direction::West)),
         KEY_RIGHT => return Some(KeyAction::Move(Direction::East)),
         KEY_DOWN => return Some(KeyAction::Move(Direction::South)),
@@ -79,7 +82,7 @@ pub(crate) fn key_action(
         None => config?.find_keybind(keycode, modifiers)?,
     };
     match command {
-        Command::Overview => Some(KeyAction::Dismiss),
+        Command::Overview => Some(KeyAction::Close),
         // Rows are workspaces, so a workspace switch moves between rows too.
         Command::Window(
             Operation::Focus(direction)
@@ -109,21 +112,40 @@ pub struct Overview {
     pub phase: OverviewPhase,
     /// 0.0 = windows at their real on-screen frames, 1.0 = fully zoomed out.
     pub progress: f32,
+    /// The focused window's tile, derived by `overview_project`.
     pub selected: Option<Entity>,
     /// The tile under the mouse pointer, highlighted but not selected.
     pub hovered: Option<Entity>,
     pub layout: OverviewLayout,
+    /// The display the overview opened on. It closes if another becomes active.
+    pub display: CGDirectDisplayID,
+    /// Asks `overview_project` to re-project once, even with nothing changed.
+    pub reproject: bool,
 }
 
 impl Overview {
-    fn opening() -> Self {
+    fn opening(display: CGDirectDisplayID) -> Self {
         Self {
             phase: OverviewPhase::Opening,
             progress: 0.0,
             selected: None,
             hovered: None,
             layout: OverviewLayout::default(),
+            display,
+            reproject: false,
         }
+    }
+
+    /// Starts the close, activating `activate` once it finishes. A no-op once
+    /// already closing, so the first close path to fire wins.
+    fn close(&mut self, activate: Option<Entity>) {
+        if matches!(self.phase, OverviewPhase::Closing { .. }) {
+            return;
+        }
+        self.phase = OverviewPhase::Closing { activate };
+        // Tiles must zoom back to where the windows are now, not where they
+        // were at the last projection.
+        self.reproject = true;
     }
 }
 
@@ -143,97 +165,6 @@ impl OverviewLayout {
                 .map(|tile| (index, tile))
         })
     }
-
-    fn active_row_first(&self) -> Option<Entity> {
-        self.rows
-            .iter()
-            .find(|row| row.is_active)
-            .and_then(|row| row.tiles.first())
-            .map(|tile| tile.entity)
-    }
-}
-
-/// The tile in `row` whose settled centre is horizontally nearest `x`.
-fn nearest_by_x(row: &OverviewRow, x: i32) -> Option<Entity> {
-    row.tiles
-        .iter()
-        .min_by_key(|tile| (tile.target.center().x - x).abs())
-        .map(|tile| tile.entity)
-}
-
-/// The tile to select when the overview opens: the focused window's, else the
-/// active row's first, else nothing.
-pub fn initial_selection(layout: &OverviewLayout, focused: Option<Entity>) -> Option<Entity> {
-    focused
-        .filter(|entity| layout.find(*entity).is_some())
-        .or_else(|| layout.active_row_first())
-}
-
-/// Keeps the cursor on a live tile after a re-projection. `previous` is the
-/// row index and centre x the selection had before; a vanished selection lands
-/// on the nearest tile of that row, else the active row's first tile, else any.
-fn reselect(
-    layout: &OverviewLayout,
-    selected: Option<Entity>,
-    previous: Option<(usize, i32)>,
-) -> Option<Entity> {
-    selected
-        .filter(|entity| layout.find(*entity).is_some())
-        .or_else(|| {
-            previous.and_then(|(row, x)| {
-                let last = layout.rows.len().checked_sub(1)?;
-                nearest_by_x(&layout.rows[row.min(last)], x)
-            })
-        })
-        .or_else(|| layout.active_row_first())
-        .or_else(|| {
-            layout
-                .rows
-                .iter()
-                .find_map(|row| row.tiles.first())
-                .map(|tile| tile.entity)
-        })
-}
-
-/// Where the cursor goes from `selected` in `direction`, by the same rule the
-/// real `window_focus_*` / `window_focusorvirtual_*` bindings use.
-///
-/// Within a row this is [`get_window_in_direction`]. When that finds nothing
-/// going North or South — the edge of a stack, or any non-stack column — the
-/// cursor falls through to the nearest non-empty row that way, landing on the
-/// tile horizontally nearest the current one. It never wraps: with nowhere to
-/// go it stays put. `strips` pairs each row's strip entity with its strip.
-pub fn move_selection(
-    layout: &OverviewLayout,
-    strips: &[(Entity, &LayoutStrip)],
-    selected: Entity,
-    direction: &Direction,
-) -> Entity {
-    let Some((row_index, tile)) = layout.find(selected) else {
-        return selected;
-    };
-    let row = &layout.rows[row_index];
-    let within_row = strips
-        .iter()
-        .find(|(entity, _)| *entity == row.strip)
-        .and_then(|(_, strip)| get_window_in_direction(direction, selected, strip))
-        .filter(|next| layout.find(*next).is_some());
-    if let Some(next) = within_row {
-        return next;
-    }
-
-    let x = tile.target.center().x;
-    let fall_through = match direction {
-        Direction::North => layout.rows[..row_index]
-            .iter()
-            .rev()
-            .find_map(|row| nearest_by_x(row, x)),
-        Direction::South => layout.rows[row_index + 1..]
-            .iter()
-            .find_map(|row| nearest_by_x(row, x)),
-        _ => None,
-    };
-    fall_through.unwrap_or(selected)
 }
 
 /// The tile under `point` (absolute CG coordinates) as drawn at `progress`.
@@ -465,6 +396,9 @@ fn overview_toggle(
     mut messages: MessageReader<Event>,
     overview: Option<ResMut<Overview>>,
     mission_control: Res<MissionControlActive>,
+    // A plain query, not `ActiveDisplay`: that one's `Single` would unschedule
+    // this system whenever no display is active, and then nothing could close.
+    displays: Query<&Display, With<ActiveDisplayMarker>>,
     mut commands: Commands,
 ) {
     let toggled = messages.read().any(|event| {
@@ -480,52 +414,62 @@ fn overview_toggle(
     }
 
     if let Some(mut overview) = overview {
-        // Already on its way out: nothing more to do.
-        if !matches!(overview.phase, OverviewPhase::Closing { .. }) {
-            overview.phase = OverviewPhase::Closing { activate: None };
-        }
-    } else if !mission_control.0 {
+        overview.close(None);
+    } else if !mission_control.0
+        && let Ok(display) = displays.single()
+    {
         // Mission Control already shows every window, and suppresses overlays;
         // an overview on top of it would be drawn over the wrong layout.
-        commands.insert_resource(Overview::opening());
+        commands.insert_resource(Overview::opening(display.id()));
         set_overview_active(true);
     }
 }
 
-/// Keyboard and mouse input while the overview is open. Nothing here touches a
-/// real window: the cursor only moves, and a commit starts the close with the
-/// window to activate once the animation ends.
+/// Keyboard and mouse input while the overview is open. A move is a real focus
+/// command, run on the live layout behind the overview, which re-projects to
+/// follow it. Closing leaves focus where it is; a click closes onto its tile.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn overview_input(
     mut messages: MessageReader<Event>,
     mut overview: ResMut<Overview>,
-    strips: Query<(Entity, &LayoutStrip)>,
     mission_control: Res<MissionControlActive>,
+    displays: Query<&Display, With<ActiveDisplayMarker>>,
     config: Option<Res<Config>>,
+    mut commands: Commands,
 ) {
-    if mission_control.0 && !matches!(overview.phase, OverviewPhase::Closing { .. }) {
-        overview.phase = OverviewPhase::Closing { activate: None };
+    // It only ever shows the display it opened on.
+    if mission_control.0 || displays.single().map(Display::id).ok() != Some(overview.display) {
+        overview.close(None);
     }
     for event in messages.read() {
         if matches!(overview.phase, OverviewPhase::Closing { .. }) {
             return;
         }
-        let action = match event {
+        match event {
             Event::OverviewKey { keycode, modifiers } => {
-                key_action(*keycode, *modifiers, config.as_deref(), &lua_keybinds())
+                match key_action(*keycode, *modifiers, config.as_deref(), &lua_keybinds()) {
+                    Some(KeyAction::Close) => overview.close(None),
+                    Some(KeyAction::Move(direction)) => {
+                        // Rows are workspaces: up and down leave a stack for
+                        // the workspace above or below.
+                        let operation = match direction {
+                            Direction::North | Direction::South => {
+                                Operation::FocusOrVirtual(direction)
+                            }
+                            _ => Operation::Focus(direction),
+                        };
+                        commands.trigger(SendMessageTrigger(Event::Command {
+                            command: Command::Window(operation),
+                        }));
+                    }
+                    None => {}
+                }
             }
-            // A click commits to the tile under it; a click anywhere else
-            // dismisses, like clicking outside a menu.
+            // A click activates the tile under it; a click anywhere else
+            // closes, like clicking outside a menu.
             Event::MouseDown { point, .. } => {
                 let hit = tile_at(&overview.layout, overview.progress, cg_point(*point));
-                if hit.is_some() {
-                    overview.selected = hit;
-                }
-                Some(if hit.is_some() {
-                    KeyAction::Activate
-                } else {
-                    KeyAction::Dismiss
-                })
+                overview.close(hit);
             }
             Event::MouseMoved { point, .. } => {
                 let hit = tile_at(&overview.layout, overview.progress, cg_point(*point));
@@ -534,51 +478,45 @@ fn overview_input(
                 if overview.hovered != hit {
                     overview.hovered = hit;
                 }
-                continue;
             }
-            _ => continue,
-        };
-        match action {
-            Some(KeyAction::Dismiss) => {
-                overview.phase = OverviewPhase::Closing { activate: None };
-            }
-            Some(KeyAction::Activate) => {
-                overview.phase = OverviewPhase::Closing {
-                    activate: overview.selected,
-                };
-            }
-            Some(KeyAction::Move(direction)) => {
-                if let Some(selected) = overview.selected {
-                    let strips = strips.iter().collect::<Vec<_>>();
-                    overview.selected = Some(move_selection(
-                        &overview.layout,
-                        &strips,
-                        selected,
-                        &direction,
-                    ));
-                }
-            }
-            None => {}
+            _ => {}
         }
     }
 }
 
 /// Projects the active display's rows into the overview on open, and again
-/// whenever a strip changes or a window goes away while it is up.
+/// whenever the layout, the focus or the active workspace changes while it is
+/// up, or a close asks for it. The selection is always the focused window.
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_arguments)]
 fn overview_project(
     mut overview: ResMut<Overview>,
     active_display: ActiveDisplay,
     strips: Query<(Entity, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     changed_strips: Query<(), Changed<LayoutStrip>>,
+    // `Changed`, not `Added`: re-inserting a marker on the same entity
+    // doesn't count as adding it.
+    changed_focus: Query<(), Changed<FocusedMarker>>,
+    changed_workspace: Query<(), Changed<ActiveWorkspaceMarker>>,
     mut removed_windows: RemovedComponents<Window>,
+    mut removed_focus: RemovedComponents<FocusedMarker>,
     windows: Windows,
     config: Res<Config>,
 ) {
+    // Both drained on every run, so an old removal never fires a later one.
     let window_removed = removed_windows.read().count() > 0;
-    if !overview.is_added() && changed_strips.is_empty() && !window_removed {
+    let focus_removed = removed_focus.read().count() > 0;
+    if !overview.is_added()
+        && !overview.reproject
+        && !window_removed
+        && !focus_removed
+        && changed_strips.is_empty()
+        && changed_focus.is_empty()
+        && changed_workspace.is_empty()
+    {
         return;
     }
+    overview.reproject = false;
 
     let workspace_id = active_display.active_strip().id();
     let rows = strips
@@ -592,25 +530,16 @@ fn overview_project(
         &|entity| windows.moving_frame(entity),
     );
 
-    overview.selected = if overview.is_added() {
-        // A focused tab stands for its whole group, whose tile carries the
-        // group's first member.
-        let focused = windows.focused().map(|(_, entity)| {
-            rows.iter()
-                .find_map(|(_, strip, _)| strip.tab_group(entity))
-                .and_then(|group| group.first().copied())
-                .unwrap_or(entity)
-        });
-        initial_selection(&layout, focused)
-    } else {
-        let previous = overview.selected.and_then(|selected| {
-            overview
-                .layout
-                .find(selected)
-                .map(|(row, tile)| (row, tile.target.center().x))
-        });
-        reselect(&layout, overview.selected, previous)
-    };
+    // A focused tab stands for its whole group, whose tile carries the group's
+    // first member. Focus on a window with no tile (floating, unmanaged, on
+    // another display) selects nothing.
+    let focused = windows.focused().map(|(_, entity)| {
+        rows.iter()
+            .find_map(|(_, strip, _)| strip.tab_group(entity))
+            .and_then(|group| group.first().copied())
+            .unwrap_or(entity)
+    });
+    overview.selected = focused.filter(|entity| layout.find(*entity).is_some());
     if overview
         .hovered
         .is_some_and(|hovered| layout.find(hovered).is_none())
