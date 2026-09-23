@@ -735,6 +735,7 @@ pub(super) fn window_minimized_trigger(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_managed_trigger(
     trigger: On<Remove, Unmanaged>,
@@ -751,6 +752,7 @@ pub(super) fn window_managed_trigger(
     >,
     previous_strips: Query<&PreviousManagedStrip>,
     initializing: Option<Res<Initializing>>,
+    mut focus_history: ResMut<FocusHistory>,
     mut ctx: WindowCtx,
 ) {
     // finish_setup handles the initial strip assignment during init.
@@ -822,18 +824,23 @@ pub(super) fn window_managed_trigger(
         if let Some(index) = insert_at {
             active_strip.insert_at(index, entity);
         } else {
-            // Insert at the column the floating window visually overlaps so the
-            // strip doesn't have to scroll to the end to expose the new column.
-            let insertion = ctx.windows.frame(entity).and_then(|frame| {
-                let center_x = frame.center().x;
-                active_strip.all_columns().into_iter().position(|top| {
-                    ctx.windows
-                        .frame(top)
-                        .is_some_and(|col| col.center().x > center_x)
-                })
-            });
-            let insertion = insertion.unwrap_or(active_strip.len());
-            active_strip.insert_at(insertion, entity);
+            // niri: a window joining the tiled layout becomes a new column
+            // right of the active one — the last-focused tiled window here.
+            let workspace_id = active_strip.id();
+            let anchor = focus_history
+                .last_managed(workspace_id)
+                .filter(|anchor| *anchor != entity && active_strip.contains(*anchor));
+            let index = anchor
+                .and_then(|anchor| active_strip.index_of(anchor).ok())
+                .map_or(active_strip.len(), |index| index + 1);
+            active_strip.insert_at(index, entity);
+            if ctx
+                .windows
+                .focused()
+                .is_some_and(|(_, focused)| focused == entity)
+            {
+                focus_history.tiled_beside(workspace_id, entity, anchor);
+            }
         }
     }
 
