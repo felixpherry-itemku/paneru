@@ -89,6 +89,8 @@ struct MockStateInner {
     /// modelling the lag real apps show right after a window closes.
     stale_window_ids: HashMap<WinID, Pid>,
     unordered_windows: HashSet<WinID>,
+    /// Windows whose close button was pressed, in order.
+    closed: Vec<WinID>,
 }
 
 #[derive(Clone)]
@@ -109,8 +111,14 @@ impl MockState {
                 event_queue: VecDeque::new(),
                 stale_window_ids: HashMap::new(),
                 unordered_windows: HashSet::new(),
+                closed: Vec::new(),
             })),
         }
+    }
+
+    /// Windows whose close button was pressed, in order.
+    pub fn closed_windows(&self) -> Vec<WinID> {
+        self.inner.force_read().closed.clone()
     }
 
     #[allow(dead_code)]
@@ -567,6 +575,12 @@ impl MockState {
         // Fill in remaining defaults
         mw.expect_element().return_const(None);
         mw.expect_raise_without_focus().return_const(());
+
+        let s = self.clone();
+        mw.expect_close().returning(move || {
+            s.inner.force_write().closed.push(id);
+            Ok(())
+        });
 
         // Focusing without raising still moves the OS focus, it just leaves the
         // window order alone. Only the app's idea of its focused window changes

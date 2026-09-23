@@ -8,7 +8,7 @@ use bevy::ecs::query::{Has, With, Without};
 use bevy::ecs::system::{Commands, Query, Res, ResMut, Single};
 use bevy::math::IRect;
 use tracing::{Level, instrument};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 mod query;
 
@@ -102,7 +102,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
     // A default dialect so the mock harness has one; the real app overwrites it
     // once it knows whether a Lua script took over the configuration.
     app.init_resource::<SnippetDialect>();
-    app.add_systems(PreUpdate, copy_window_rule);
+    app.add_systems(PreUpdate, (copy_window_rule, close_window));
 }
 
 pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
@@ -1036,6 +1036,24 @@ fn manage_window(
         strip.append(entity);
         commands.reshuffle_around(entity);
     }
+}
+
+/// Closes the focused window by pressing its close button. Its removal flows
+/// through the usual destroyed-window path.
+fn close_window(mut messages: MessageReader<Event>, windows: Windows) {
+    if filter_window_operations(&mut messages, |op| matches!(op, Operation::Close))
+        .next()
+        .is_none()
+    {
+        return;
+    }
+    let Some((window, _)) = windows.focused() else {
+        debug!("no focused window to close");
+        return;
+    };
+    _ = window
+        .close()
+        .inspect_err(|err| warn!("closing window {}: {err}", window.id()));
 }
 
 /// Copies a `[windows]` configuration rule for the focused window to the

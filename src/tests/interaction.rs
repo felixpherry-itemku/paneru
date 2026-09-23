@@ -3206,6 +3206,22 @@ fn test_copy_window_rule_command() {
         .run(commands);
 }
 
+/// `window close` presses the focused window's close button, and only its.
+#[test]
+fn test_close_window_command_presses_the_focused_close_button() {
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(1, |_world, state| {
+            assert_eq!(state.closed_windows(), vec![0]);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::Window(Operation::Close),
+            },
+        ]);
+}
+
 /// `virtualnum` on a missing row spawns it — row 0 included. Row 0 used to be
 /// the one index that bailed out instead, so a space that had lost its row 0
 /// could never switch back to workspace "1".

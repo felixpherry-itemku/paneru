@@ -277,6 +277,8 @@ pub enum Operation {
     /// Copies a `[windows]` configuration rule for the focused window to the
     /// clipboard.
     CopyRule,
+    /// Closes the focused window by pressing its close button.
+    Close,
 }
 
 /// Defines operations that can be performed on the mouse.

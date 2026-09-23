@@ -98,6 +98,7 @@ fn parse_operation(argv: &[&str]) -> Result<Operation> {
         "nextdisplaysend" => Operation::ToNextDisplay(MoveFocus::Stay),
         "snap" => Operation::Snap,
         "copyrule" => Operation::CopyRule,
+        "close" => Operation::Close,
         // The `virtual*` verbs take either a direction or a workspace number,
         // and `num` variants that only take a number.
         "virtual" => virtual_target(argument()?, Operation::Virtual, Operation::VirtualNumber)?,
@@ -223,6 +224,7 @@ impl Operation {
             Operation::RaiseFloating => owned(&["raise", "floating"]),
             Operation::ToggleFloatingLayer => owned(&["togglefloatlayer"]),
             Operation::CopyRule => owned(&["copyrule"]),
+            Operation::Close => owned(&["close"]),
         }
     }
 }
@@ -269,6 +271,7 @@ mod tests {
             Operation::RaiseFloating,
             Operation::ToggleFloatingLayer,
             Operation::CopyRule,
+            Operation::Close,
         ];
 
         for operation in operations {
@@ -311,6 +314,14 @@ mod tests {
             "the first window is number 1"
         );
         assert!(Direction::parse_positional("0").is_err());
+    }
+
+    #[test]
+    fn window_close_parses() {
+        assert_eq!(
+            parse_command(&["window", "close"]),
+            Ok(Command::Window(Operation::Close))
+        );
     }
 
     #[test]
