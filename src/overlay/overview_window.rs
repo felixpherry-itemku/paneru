@@ -22,6 +22,7 @@ use objc2_foundation::{
 
 use super::{cg_abs_to_cocoa, make_overlay_window, primary_screen_height};
 use crate::events::EventSender;
+use crate::platform::input::set_overview_window;
 use crate::platform::{Pid, WinID};
 use crate::util::rgba_bitmap_context;
 
@@ -347,12 +348,16 @@ impl OverviewRenderer {
         let (window, view) = self.window.get_or_insert_with(|| {
             let window = make_overlay_window(self.mtm, frame);
             // Above every application window, the menu bar and the Dock.
-            // Mouse events stay ignored: clicks reach the overview through the
-            // event tap, so the window never becomes key.
             window.setLevel(NSScreenSaverWindowLevel);
+            // Hit-tested like any window, so the event tap can tell whether a
+            // click lands on the overview or on something drawn above it. The
+            // tap consumes the clicks it takes, so the window never becomes
+            // key and never activates Paneru.
+            window.setIgnoresMouseEvents(false);
             let view = OverviewView::new(self.mtm, NSRect::new(NSPoint::ZERO, frame.size));
             window.setContentView(Some(&view));
             window.orderFront(None::<&AnyObject>);
+            set_overview_window(window.windowNumber());
             (window, view)
         });
         if resized {
@@ -435,6 +440,7 @@ impl OverviewRenderer {
 
     /// Takes the window down and forgets everything drawn in it.
     pub fn close(&mut self) {
+        set_overview_window(0);
         if let Some((window, view)) = self.window.take() {
             window.orderOut(None::<&AnyObject>);
             // Explicitly, rather than trusting AppKit to free the view with

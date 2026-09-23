@@ -1,9 +1,9 @@
 use arc_swap::ArcSwap;
 use core::ptr::NonNull;
-use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2_app_kit::{NSEvent, NSEventType, NSTouch, NSTouchPhase};
+use objc2::{MainThreadMarker, msg_send};
+use objc2_app_kit::{NSEvent, NSEventType, NSTouch, NSTouchPhase, NSWindow};
 use objc2_core_foundation::{
     CFMachPort, CFRetained, CFRunLoop, CFRunLoopSource, kCFRunLoopCommonModes,
 };
@@ -11,13 +11,13 @@ use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventFlags, CGEventTapLocation, CGEventTapOptions,
     CGEventTapPlacement, CGEventTapProxy, CGEventType,
 };
-use objc2_foundation::NSSet;
+use objc2_foundation::{NSPoint, NSSet};
 use scopeguard::ScopeGuard;
 use std::ffi::c_void;
 use std::marker::PhantomPinned;
 use std::pin::Pin;
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use stdext::function_name;
@@ -28,6 +28,7 @@ use crate::config::Config;
 use crate::ecs::overview::{CHORD_MODIFIERS, key_action};
 use crate::errors::{Error, Result};
 use crate::events::{Event, EventSender};
+use crate::overlay::primary_screen_height;
 use crate::platform::Modifiers;
 
 const NX_DEVICEFNKEYMASK: u64 = 0x0080_0100;
@@ -53,6 +54,15 @@ static OVERVIEW_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// it, or bare typing stays swallowed.
 pub fn set_overview_active(active: bool) {
     OVERVIEW_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+/// The overview window's number while it is on screen, else 0. The tap takes a
+/// click only when this window is topmost under the pointer.
+static OVERVIEW_WINDOW: AtomicIsize = AtomicIsize::new(0);
+
+/// Publishes the overview window's number, or 0 once it is taken down.
+pub fn set_overview_window(number: isize) {
+    OVERVIEW_WINDOW.store(number, Ordering::Relaxed);
 }
 
 /// How long to suppress scroll wheel events after a vertical swipe gesture,
@@ -366,6 +376,22 @@ impl InputHandler {
         let flags = CGEvent::flags(Some(event));
         let modifiers = get_modifiers(flags);
 
+        let button = matches!(
+            event_type,
+            CGEventType::LeftMouseDown
+                | CGEventType::LeftMouseUp
+                | CGEventType::LeftMouseDragged
+                | CGEventType::RightMouseDown
+                | CGEventType::RightMouseUp
+                | CGEventType::RightMouseDragged
+        );
+        // The overview takes a click only when its window is on top under the
+        // pointer. Anything drawn above it, such as the screenshot crosshair,
+        // gets the click instead, and the overview never hears of it.
+        if button && OVERVIEW_ACTIVE.load(Ordering::Relaxed) && !over_overview_window(event) {
+            return false;
+        }
+
         let result = match event_type {
             CGEventType::LeftMouseDown | CGEventType::RightMouseDown => {
                 let point = CGEvent::location(Some(event));
@@ -405,9 +431,9 @@ impl InputHandler {
             // Trigger cleanup destructor, unregistering the handler.
             self.events = None;
         }
-        // Clicks still reach the overview through the events sent above, but
-        // must not also land on the application window underneath it. Pointer
-        // motion falls through so the cursor keeps moving.
+        // A click on the overview reaches it through the event sent above,
+        // and must not also land on its window: that would activate Paneru.
+        // Pointer motion falls through so the cursor keeps moving.
         let is_click = !matches!(event_type, CGEventType::MouseMoved);
         is_click && OVERVIEW_ACTIVE.load(Ordering::Relaxed)
     }
@@ -649,6 +675,21 @@ impl InputHandler {
         }
         self.config.find_keybind(keycode, mask)
     }
+}
+
+/// Whether the overview window is the topmost window under the pointer. Only
+/// button events ask, never pointer moves: this is a window-server lookup.
+fn over_overview_window(event: &CGEvent) -> bool {
+    let ours = OVERVIEW_WINDOW.load(Ordering::Relaxed);
+    // The tap runs on the main run loop, so the marker is always there.
+    ours != 0
+        && MainThreadMarker::new().is_some_and(|mtm| {
+            let point = CGEvent::location(Some(event));
+            // CG's origin is the primary display's top-left, Cocoa's its
+            // bottom-left.
+            let point = NSPoint::new(point.x, primary_screen_height(mtm) - point.y);
+            NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(point, 0, mtm) == ours
+        })
 }
 
 /// Where a key goes while the overview is open.

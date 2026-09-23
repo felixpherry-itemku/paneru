@@ -185,7 +185,7 @@ fn cg_abs_to_cocoa(frame: NSRect, primary_screen_height: f64) -> NSRect {
 /// so it must be *that* screen — `NSScreen::screens()[0]` is NOT reliably the
 /// main display, and using the wrong one offsets the overlay (and, when
 /// displays are stacked, lands it on the wrong monitor).
-fn primary_screen_height(mtm: MainThreadMarker) -> f64 {
+pub(crate) fn primary_screen_height(mtm: MainThreadMarker) -> f64 {
     let screens = NSScreen::screens(mtm);
     let mut fallback = 0.0;
     let mut first = true;
