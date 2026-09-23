@@ -236,6 +236,12 @@ impl MockState {
         self.inner.force_read().active_display_id
     }
 
+    /// Makes `id` the display macOS reports as active. Paneru picks it up on
+    /// the next `Event::DisplayChanged`.
+    pub fn set_active_display(&self, id: u32) {
+        self.inner.force_write().active_display_id = id;
+    }
+
     pub(crate) fn activate_workspace(
         &self,
         display_id: u32,
