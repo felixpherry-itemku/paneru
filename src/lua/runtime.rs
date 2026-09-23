@@ -25,10 +25,8 @@ use super::api;
 use super::world::DispatchWorld;
 use crate::commands::Command;
 use crate::config::Config;
-use crate::platform::Modifiers;
 
-/// A Lua-registered keybind: `(keycode, modifiers, handler_id)`.
-pub type LuaKeybind = (u8, Modifiers, u32);
+pub use crate::platform::input::LuaKeybind;
 
 /// A store failure, spelled the way the script called it.
 pub(super) fn store_error(call: &str, message: &str) -> mlua::Error {
@@ -192,8 +190,8 @@ impl LuaRuntime {
         &self.lua
     }
 
-    /// The `(keycode, modifiers, id)` keybinds registered by the script, for
-    /// publishing to the event-tap registry.
+    /// The keybinds registered by the script, for publishing to the event-tap
+    /// registry.
     pub fn published_keybinds(&self) -> Vec<LuaKeybind> {
         self.registry.borrow().keybinds.clone()
     }
@@ -348,8 +346,10 @@ mod tests {
     use super::super::worker::{Shared, StoreRequest, WorldRequest};
     use super::super::world::WorldAccess;
     use super::*;
+    use crate::commands::{Direction, Operation};
     use crate::ecs::state::PaneruQueryState;
     use crate::events::Event;
+    use crate::platform::Modifiers;
 
     /// A competing writer, run just before a write lands.
     type Interjection = Box<dyn FnMut(&mut ScriptState)>;
@@ -499,9 +499,13 @@ mod tests {
             .unwrap();
         let binds = runtime.published_keybinds();
         assert_eq!(binds.len(), 1);
-        let (_, modifiers, id) = binds[0];
-        assert_eq!(modifiers, Modifiers::ALT);
-        assert_eq!(id, 1);
+        let (_, modifiers, id, command) = &binds[0];
+        assert_eq!(*modifiers, Modifiers::ALT);
+        assert_eq!(*id, 1);
+        assert_eq!(
+            *command,
+            Some(Command::Window(Operation::Focus(Direction::East)))
+        );
     }
 
     #[test]

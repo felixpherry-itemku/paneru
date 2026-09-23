@@ -11,8 +11,8 @@ use crate::commands::{Command, Direction, MoveFocus, Operation};
 use crate::ecs::ActiveWorkspaceMarker;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::overview::{
-    Overview, OverviewConfig, OverviewLayout, OverviewPhase, OverviewTile, initial_selection,
-    move_selection, project, step_progress,
+    KeyAction, Overview, OverviewConfig, OverviewLayout, OverviewPhase, OverviewTile,
+    initial_selection, key_action, move_selection, project, step_progress,
 };
 use crate::ecs::params::FrameActivity;
 use crate::events::Event;
@@ -377,6 +377,38 @@ fn test_overview_mid_frame_only_while_animating() {
         !mid_frame(Some(OverviewPhase::Open)),
         "a settled overview idles"
     );
+}
+
+// ── Key mapping (pure) ─────────────────────────────────────────────────────
+
+/// A config from `init.lua` has no TOML bindings at all: every chord lives in
+/// the Lua keybind set, so that is where the overview must look.
+#[test]
+fn test_overview_keys_follow_lua_binds() {
+    const KEY_O: u8 = 31;
+    const KEY_H: u8 = 4;
+    const KEY_F: u8 = 3;
+    let binds = [
+        (KEY_O, Modifiers::ALT, 1, Some(Command::Overview)),
+        (
+            KEY_H,
+            Modifiers::ALT,
+            2,
+            Some(Command::Window(Operation::Focus(Direction::West))),
+        ),
+        // A function handler: nothing to map.
+        (KEY_F, Modifiers::ALT, 3, None),
+    ];
+    assert_eq!(
+        key_action(KEY_O, Modifiers::ALT, None, &binds),
+        Some(KeyAction::Dismiss)
+    );
+    assert_eq!(
+        key_action(KEY_H, Modifiers::ALT, None, &binds),
+        Some(KeyAction::Move(Direction::West))
+    );
+    assert_eq!(key_action(KEY_F, Modifiers::ALT, None, &binds), None);
+    assert_eq!(key_action(KEY_H, Modifiers::empty(), None, &binds), None);
 }
 
 // ── Selection and activation (harness) ─────────────────────────────────────

@@ -29,7 +29,7 @@ use crate::events::Event;
 use crate::manager::Window;
 use crate::overlay::{OverviewRenderer, OverviewScene, SceneRow, SceneTile};
 use crate::platform::Modifiers;
-use crate::platform::input::set_overview_active;
+use crate::platform::input::{LuaKeybind, lua_keybinds, set_overview_active};
 
 /// Escape. Always closes, so a swallowed keyboard can never get stuck.
 const KEY_ESCAPE: u8 = 53;
@@ -42,7 +42,7 @@ const KEY_UP: u8 = 126;
 
 /// What an input does while the overview is open.
 #[derive(Debug, PartialEq)]
-enum KeyAction {
+pub(crate) enum KeyAction {
     /// Close, activating nothing.
     Dismiss,
     /// Close, activating the selection.
@@ -52,7 +52,12 @@ enum KeyAction {
 
 /// Maps a key to its overview action. The hardcoded keys come first, so
 /// Escape can never be rebound away.
-fn key_action(keycode: u8, modifiers: Modifiers, config: Option<&Config>) -> Option<KeyAction> {
+pub(crate) fn key_action(
+    keycode: u8,
+    modifiers: Modifiers,
+    config: Option<&Config>,
+    lua_binds: &[LuaKeybind],
+) -> Option<KeyAction> {
     match keycode {
         KEY_ESCAPE => return Some(KeyAction::Dismiss),
         KEY_RETURN | KEY_KEYPAD_ENTER => return Some(KeyAction::Activate),
@@ -63,8 +68,17 @@ fn key_action(keycode: u8, modifiers: Modifiers, config: Option<&Config>) -> Opt
         _ => {}
     }
     // The user's own focus chords mean what they mean outside the overview,
-    // so `alt+j` needs no second binding table to mean "down" in here.
-    match config?.find_keybind(keycode, modifiers)? {
+    // so `alt+j` needs no second binding table to mean "down" in here. Lua
+    // binds shadow TOML ones, as in the event tap; one with a function handler
+    // means nothing here.
+    let lua_bind = lua_binds
+        .iter()
+        .find(|(code, mask, _, _)| *code == keycode && mask.matches(modifiers));
+    let command = match lua_bind {
+        Some((_, _, _, command)) => command.clone()?,
+        None => config?.find_keybind(keycode, modifiers)?,
+    };
+    match command {
         Command::Overview => Some(KeyAction::Dismiss),
         Command::Window(Operation::Focus(direction) | Operation::FocusOrVirtual(direction)) => {
             Some(KeyAction::Move(direction))
@@ -495,7 +509,7 @@ fn overview_input(
         }
         let action = match event {
             Event::OverviewKey { keycode, modifiers } => {
-                key_action(*keycode, *modifiers, config.as_deref())
+                key_action(*keycode, *modifiers, config.as_deref(), &lua_keybinds())
             }
             // A click commits to the tile under it; a click anywhere else
             // dismisses, like clicking outside a menu.

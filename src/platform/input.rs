@@ -96,17 +96,27 @@ impl Touch {
     }
 }
 
-/// Keybinds registered by the Lua runtime as `(keycode, modifiers, handler_id)`,
-/// shared lock-free with the event tap. Checked before the config bindings so a
-/// scripted bind can override a TOML one.
-static LUA_KEYBINDS: LazyLock<ArcSwap<Vec<(u8, Modifiers, u32)>>> =
+/// A Lua-registered keybind: `(keycode, modifiers, handler_id, command)`.
+/// `command` is the parsed command of a command-string handler, `None` for a
+/// function handler — only a string says what it does without running it.
+pub type LuaKeybind = (u8, Modifiers, u32, Option<Command>);
+
+/// Keybinds registered by the Lua runtime, shared lock-free with the event tap.
+/// Checked before the config bindings so a scripted bind can override a TOML
+/// one.
+static LUA_KEYBINDS: LazyLock<ArcSwap<Vec<LuaKeybind>>> =
     LazyLock::new(|| ArcSwap::from_pointee(Vec::new()));
 
 /// Replace the Lua keybind set that the event tap checks on every key-down.
 /// Called from the main thread on script load and hot reload.
 #[cfg(feature = "lua")]
-pub fn set_lua_keybinds(keys: Vec<(u8, Modifiers, u32)>) {
+pub fn set_lua_keybinds(keys: Vec<LuaKeybind>) {
     LUA_KEYBINDS.store(Arc::new(keys));
+}
+
+/// The current Lua keybind set, for the overview's modal key handling.
+pub fn lua_keybinds() -> Arc<Vec<LuaKeybind>> {
+    LUA_KEYBINDS.load_full()
 }
 
 const SWIPE_THRESHOLD: f64 = 0.001;
@@ -613,9 +623,9 @@ impl InputHandler {
                 }
                 // Lua-registered binds take precedence over the TOML config.
                 let lua_binds = LUA_KEYBINDS.load();
-                if let Some((_, _, id)) = lua_binds
+                if let Some((_, _, id, _)) = lua_binds
                     .iter()
-                    .find(|(c, m, _)| *c == keycode && m.matches(mask))
+                    .find(|(c, m, _, _)| *c == keycode && m.matches(mask))
                 {
                     return Some(Command::Lua(*id));
                 }
