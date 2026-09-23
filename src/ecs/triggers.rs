@@ -571,6 +571,7 @@ pub(super) fn window_unmanaged_trigger(
     // whole observer, but the strip removal below must still run without one.
     active_display: Option<ActiveDisplayViewport>,
     initializing: Option<Res<Initializing>>,
+    mut focus_history: ResMut<FocusHistory>,
     mut ctx: WindowCtx,
 ) {
     const UNMANAGED_MAX_SCREEN_RATIO_NUM: i32 = 4;
@@ -629,10 +630,23 @@ pub(super) fn window_unmanaged_trigger(
     // Drop the strip membership first, before anything below can bail early —
     // a floating window still reserves column space in the strip otherwise,
     // leaving a gap that never closes on its own.
+    // niri: the active column hands its role to the column now at its index,
+    // or to the new last column when it was the last one.
     for (mut strip, _) in &mut workspaces {
-        if strip.contains(entity) {
-            strip.remove(entity);
-        }
+        let Ok(index) = strip.index_of(entity) else {
+            continue;
+        };
+        strip.remove(entity);
+        let columns = strip.all_columns();
+        let successor = columns
+            .get(index.min(columns.len().saturating_sub(1)))
+            .copied();
+        focus_history.hand_off(
+            strip.id(),
+            entity,
+            |column| strip.contains(column),
+            successor,
+        );
     }
 
     let Some((display, dock)) = active_display.map(|display| *display) else {
