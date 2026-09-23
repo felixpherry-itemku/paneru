@@ -80,9 +80,12 @@ pub(crate) fn key_action(
     };
     match command {
         Command::Overview => Some(KeyAction::Dismiss),
-        Command::Window(Operation::Focus(direction) | Operation::FocusOrVirtual(direction)) => {
-            Some(KeyAction::Move(direction))
-        }
+        // Rows are workspaces, so a workspace switch moves between rows too.
+        Command::Window(
+            Operation::Focus(direction)
+            | Operation::FocusOrVirtual(direction)
+            | Operation::Virtual(direction),
+        ) => Some(KeyAction::Move(direction)),
         _ => None,
     }
 }

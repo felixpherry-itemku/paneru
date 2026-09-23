@@ -408,6 +408,16 @@ fn test_overview_keys_follow_lua_binds() {
         Some(KeyAction::Move(Direction::West))
     );
     assert_eq!(key_action(KEY_F, Modifiers::ALT, None, &binds), None);
+    let virtual_south = [(
+        KEY_H,
+        Modifiers::ALT,
+        4,
+        Some(Command::Window(Operation::Virtual(Direction::South))),
+    )];
+    assert_eq!(
+        key_action(KEY_H, Modifiers::ALT, None, &virtual_south),
+        Some(KeyAction::Move(Direction::South))
+    );
     assert_eq!(key_action(KEY_H, Modifiers::empty(), None, &binds), None);
 }
 
