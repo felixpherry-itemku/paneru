@@ -735,8 +735,6 @@ impl Config {
         self.overview().row_gap.unwrap_or(24).max(0)
     }
 
-    // Unread until overview-niri-centring Phase 2 wires it into `OverviewConfig`.
-    #[allow(dead_code)]
     pub fn overview_zoom(&self) -> f64 {
         self.overview()
             .zoom

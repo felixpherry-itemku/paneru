@@ -173,7 +173,8 @@ pub struct OverviewRow {
     pub strip: Entity,
     pub virtual_index: u32,
     pub is_active: bool,
-    /// Row band in absolute CG display coordinates.
+    /// The zoomed viewport the row is placed in, in absolute CG display
+    /// coordinates.
     pub band: IRect,
     pub tiles: Vec<OverviewTile>,
 }
@@ -212,31 +213,34 @@ impl OverviewTile {
 /// any config-reload coupling.
 #[derive(Clone, Copy, Debug)]
 pub struct OverviewConfig {
-    /// Vertical gap between row bands, also used as the side margin.
+    /// Vertical gap between workspace rows.
     pub row_gap: i32,
-    /// Space reserved at the top of each band for its label.
-    pub label_height: i32,
+    /// Size of every row relative to the viewport.
+    pub zoom: f64,
 }
 
 impl From<&Config> for OverviewConfig {
     fn from(config: &Config) -> Self {
         Self {
             row_gap: config.overview_row_gap(),
-            label_height: 20,
+            zoom: config.overview_zoom(),
         }
     }
 }
 
-/// Lays out every row of one Space as bands stacked down `viewport`, each
-/// window a tile at its true strip-relative geometry scaled to fit its band.
+/// Lays out every row of one Space at one shared zoom, the active row centred
+/// vertically in `viewport` and the others stacked above and below it, each
+/// window a tile at its true strip-relative geometry.
 ///
-/// `rows` is `(strip entity, strip, is_active)`. `frame_of` gives a window's
-/// real frame: only its size feeds the layout (via
-/// [`LayoutStrip::relative_positions`]), and the frame itself becomes the
-/// tile's animation `origin`. Parked rows and slivered columns are moved, never
-/// resized, so they project exactly like visible ones.
+/// `rows` is `(strip entity, strip, is_active, centre)`; `centre` is the window
+/// whose column sits at the horizontal centre (the first column when `None` or
+/// not in the strip). `frame_of` gives a window's real frame: only its size
+/// feeds the layout (via [`LayoutStrip::relative_positions`]). The active row
+/// animates from those real frames; every other row from its place in the
+/// same layout at full size, stacked off screen, since its real frames sit
+/// parked in a corner.
 pub fn project<F>(
-    rows: &[(Entity, &LayoutStrip, bool)],
+    rows: &[(Entity, &LayoutStrip, bool, Option<Entity>)],
     viewport: IRect,
     config: OverviewConfig,
     frame_of: &F,
@@ -245,96 +249,87 @@ where
     F: Fn(Entity) -> Option<IRect>,
 {
     let mut rows = rows.to_vec();
-    rows.sort_by_key(|(_, strip, _)| strip.virtual_index);
-    let Ok(count) = i32::try_from(rows.len()) else {
-        return OverviewLayout::default();
-    };
+    rows.sort_by_key(|(_, strip, _, _)| strip.virtual_index);
+    let active = rows
+        .iter()
+        .zip(0..)
+        .find_map(|(row, index)| row.2.then_some(index))
+        .unwrap_or(0);
 
-    let slice_height = viewport.height() / count.max(1);
+    #[allow(clippy::cast_possible_truncation)]
+    let scaled = |value: i32, scale: f64| (f64::from(value) * scale).round() as i32;
+    let full = viewport.size();
+    let zoomed = IVec2::new(scaled(full.x, config.zoom), scaled(full.y, config.zoom));
+    let centre = viewport.center();
+
     let rows = rows
         .iter()
         .zip(0..)
-        .map(|(&(strip_entity, strip, is_active), index)| {
-            let top = viewport.min.y + slice_height * index;
-            let bottom = if index + 1 == count {
-                viewport.max.y
-            } else {
-                top + slice_height
-            };
-            let half_gap = config.row_gap / 2;
-            let band = IRect::new(
-                viewport.min.x + config.row_gap,
-                top + half_gap,
-                viewport.max.x - config.row_gap,
-                bottom - half_gap,
-            );
-            let mut inner = band;
-            inner.min.y = (band.min.y + config.label_height).min(band.max.y);
+        .map(
+            |(&(strip_entity, strip, is_active, centre_window), index)| {
+                let k = index - active;
+                let top_target = centre.y - zoomed.y / 2 + k * (zoomed.y + config.row_gap);
+                let top_origin = viewport.min.y + k * (full.y + config.row_gap);
+                let left = centre.x - zoomed.x / 2;
+                let band = IRect::new(left, top_target, left + zoomed.x, top_target + zoomed.y);
 
-            let rects = strip
-                .relative_positions(viewport.height(), frame_of)
-                .collect::<Vec<_>>();
-            let tiles = fit_tiles(&rects, inner, frame_of);
+                let rects = strip
+                    .relative_positions(full.y, frame_of)
+                    .collect::<Vec<_>>();
+                // Stack and tab members share their item's x, so any of them
+                // anchors its column.
+                let anchor_x = rects
+                    .iter()
+                    .find(|(entity, _)| Some(*entity) == centre_window)
+                    .or(rects.first())
+                    .map_or(0, |(_, rect)| rect.center().x);
+                let place = |rect: IRect, scale: f64, top: i32| {
+                    let at = |point: IVec2| {
+                        IVec2::new(
+                            centre.x + scaled(point.x - anchor_x, scale),
+                            top + scaled(point.y, scale),
+                        )
+                    };
+                    IRect::from_corners(at(rect.min), at(rect.max))
+                };
 
-            OverviewRow {
-                strip: strip_entity,
-                virtual_index: strip.virtual_index,
-                is_active,
-                band,
-                tiles,
-            }
-        })
+                // `relative_positions` emits every member of a tab group back to
+                // back with the same rect. Collapse each run into one tile standing
+                // for the group.
+                let mut tiles: Vec<(IRect, OverviewTile)> = Vec::with_capacity(rects.len());
+                for &(entity, rect) in &rects {
+                    if let Some((last_rect, tile)) = tiles.last_mut()
+                        && *last_rect == rect
+                    {
+                        tile.tab_count += 1;
+                        continue;
+                    }
+                    let target = place(rect, config.zoom, top_target);
+                    let origin = if is_active {
+                        frame_of(entity).unwrap_or(target)
+                    } else {
+                        place(rect, 1.0, top_origin)
+                    };
+                    let tile = OverviewTile {
+                        entity,
+                        target,
+                        origin,
+                        tab_count: 1,
+                    };
+                    tiles.push((rect, tile));
+                }
+
+                OverviewRow {
+                    strip: strip_entity,
+                    virtual_index: strip.virtual_index,
+                    is_active,
+                    band,
+                    tiles: tiles.into_iter().map(|(_, tile)| tile).collect(),
+                }
+            },
+        )
         .collect();
     OverviewLayout { rows }
-}
-
-/// Scales strip-local `rects` to fit inside `inner`, centred, never magnified.
-fn fit_tiles<F>(rects: &[(Entity, IRect)], inner: IRect, frame_of: &F) -> Vec<OverviewTile>
-where
-    F: Fn(Entity) -> Option<IRect>,
-{
-    let bbox = rects
-        .iter()
-        .fold(IRect::new(0, 0, 0, 0), |bbox, (_, rect)| bbox.union(*rect));
-    let bbox = IRect::from_corners(bbox.min.max(IVec2::ZERO), bbox.max);
-
-    // An empty strip, or one whose windows report no width or height, has a
-    // degenerate bbox: nothing to fit, so skip the division entirely.
-    let scale = if bbox.width() > 0 && bbox.height() > 0 {
-        (f64::from(inner.width()) / f64::from(bbox.width()))
-            .min(f64::from(inner.height()) / f64::from(bbox.height()))
-            .clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
-    #[allow(clippy::cast_possible_truncation)]
-    let scaled = |value: i32| (f64::from(value) * scale).round() as i32;
-    let offset = inner.center() - IVec2::new(scaled(bbox.width()), scaled(bbox.height())) / 2;
-    let place = |point: IVec2| {
-        let local = point - bbox.min;
-        offset + IVec2::new(scaled(local.x), scaled(local.y))
-    };
-
-    // `relative_positions` emits every member of a tab group back to back with
-    // the same rect. Collapse each run into one tile standing for the group.
-    let mut tiles: Vec<(IRect, OverviewTile)> = Vec::with_capacity(rects.len());
-    for &(entity, rect) in rects {
-        if let Some((last_rect, tile)) = tiles.last_mut()
-            && *last_rect == rect
-        {
-            tile.tab_count += 1;
-            continue;
-        }
-        let target = IRect::from_corners(place(rect.min), place(rect.max));
-        let tile = OverviewTile {
-            entity,
-            target,
-            origin: frame_of(entity).unwrap_or(target),
-            tab_count: 1,
-        };
-        tiles.push((rect, tile));
-    }
-    tiles.into_iter().map(|(_, tile)| tile).collect()
 }
 
 /// One ease-out step of `progress` towards `goal`, snapping onto it once
@@ -506,7 +501,10 @@ fn overview_project(
         .filter(|(_, strip, _)| strip.id() == workspace_id)
         .collect::<Vec<_>>();
     let layout = project(
-        &rows,
+        &rows
+            .iter()
+            .map(|&(entity, strip, is_active)| (entity, strip, is_active, None))
+            .collect::<Vec<_>>(),
         active_display.actual_bounds(&config),
         OverviewConfig::from(config.as_ref()),
         &|entity| windows.moving_frame(entity),

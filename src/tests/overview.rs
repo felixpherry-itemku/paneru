@@ -85,7 +85,7 @@ const VIEWPORT: IRect = IRect {
 };
 const NO_GAPS: OverviewConfig = OverviewConfig {
     row_gap: 0,
-    label_height: 0,
+    zoom: 0.5,
 };
 
 fn entities(count: usize) -> Vec<Entity> {
@@ -109,6 +109,152 @@ fn tiles_of(layout: &OverviewLayout, row: usize) -> Vec<(Entity, IRect)> {
         .collect()
 }
 
+/// A strip at `virtual_index` with one column per window.
+fn strip_of(virtual_index: u32, wins: &[Entity]) -> LayoutStrip {
+    let mut strip = LayoutStrip::new(1, virtual_index);
+    for &entity in wins {
+        strip.append(entity);
+    }
+    strip
+}
+
+/// Each tile's target x range in `row`.
+fn x_ranges(layout: &OverviewLayout, row: usize) -> Vec<(i32, i32)> {
+    layout.rows[row]
+        .tiles
+        .iter()
+        .map(|tile| (tile.target.min.x, tile.target.max.x))
+        .collect()
+}
+
+#[test]
+fn test_overview_centres_the_centre_column() {
+    let wins = entities(3);
+    let strip = strip_of(0, &wins);
+
+    let layout = project(
+        &[(wins[0], &strip, true, Some(wins[0]))],
+        VIEWPORT,
+        NO_GAPS,
+        &unit_frame,
+    );
+
+    assert_eq!(
+        x_ranges(&layout, 0),
+        vec![(400, 600), (600, 800), (800, 1000)]
+    );
+    for tile in &layout.rows[0].tiles {
+        assert_eq!((tile.target.min.y, tile.target.max.y), (150, 450));
+    }
+}
+
+#[test]
+fn test_overview_centre_on_middle_column_is_symmetric() {
+    let wins = entities(3);
+    let strip = strip_of(0, &wins);
+
+    let layout = project(
+        &[(wins[0], &strip, true, Some(wins[1]))],
+        VIEWPORT,
+        NO_GAPS,
+        &unit_frame,
+    );
+
+    assert_eq!(
+        x_ranges(&layout, 0),
+        vec![(200, 400), (400, 600), (600, 800)]
+    );
+}
+
+#[test]
+fn test_overview_rows_share_one_zoom() {
+    let wins = entities(5);
+    let one = strip_of(0, &wins[..1]);
+    let four = strip_of(1, &wins[1..]);
+
+    let layout = project(
+        &[(wins[0], &one, true, None), (wins[1], &four, false, None)],
+        VIEWPORT,
+        NO_GAPS,
+        &unit_frame,
+    );
+
+    let sizes = layout
+        .rows
+        .iter()
+        .flat_map(|row| &row.tiles)
+        .map(|tile| tile.target.size())
+        .collect::<Vec<_>>();
+    assert_eq!(sizes, vec![IVec2::new(200, 300); 5]);
+}
+
+#[test]
+fn test_overview_parked_row_origin_is_stacked_offscreen() {
+    let wins = entities(2);
+    let active = strip_of(0, &wins[..1]);
+    let parked = strip_of(1, &wins[1..]);
+    let config = OverviewConfig {
+        row_gap: 24,
+        zoom: 0.5,
+    };
+
+    let layout = project(
+        &[
+            (wins[0], &active, true, None),
+            (wins[1], &parked, false, None),
+        ],
+        VIEWPORT,
+        config,
+        &unit_frame,
+    );
+
+    assert_eq!(
+        layout.rows[0].tiles[0].origin,
+        IRect::new(0, 0, 400, 600),
+        "the active row starts at its real frames"
+    );
+    let origin = layout.rows[1].tiles[0].origin;
+    assert_eq!(origin.min.y, VIEWPORT.min.y + 600 + config.row_gap);
+    assert_eq!(origin.width(), 400, "full size");
+}
+
+#[test]
+fn test_overview_missing_centre_falls_back_to_first_column() {
+    let wins = entities(4);
+    let strip = strip_of(0, &wins[..3]);
+    let first_centred = vec![(400, 600), (600, 800), (800, 1000)];
+
+    for centre in [None, Some(wins[3])] {
+        let layout = project(
+            &[(wins[0], &strip, true, centre)],
+            VIEWPORT,
+            NO_GAPS,
+            &unit_frame,
+        );
+        assert_eq!(x_ranges(&layout, 0), first_centred, "centre {centre:?}");
+    }
+}
+
+#[test]
+fn test_overview_tab_member_centres_its_group() {
+    let wins = entities(5);
+    let mut strip = LayoutStrip::new(1, 0);
+    strip.append(wins[0]);
+    strip.append_tab_group(&wins[1..4]);
+    strip.append(wins[4]);
+
+    let layout = project(
+        &[(wins[0], &strip, true, Some(wins[2]))],
+        VIEWPORT,
+        NO_GAPS,
+        &unit_frame,
+    );
+
+    let (_, group) = layout.find(wins[1]).expect("group tile");
+    assert_eq!(group.tab_count, 3);
+    assert_eq!((group.target.min.x, group.target.max.x), (400, 600));
+}
+
 #[test]
 fn test_overview_projects_stack_column_in_order() {
     let wins = entities(4);
@@ -120,7 +266,12 @@ fn test_overview_projects_stack_column_in_order() {
         .stack(wins[2])
         .expect("stack onto the column to the left");
 
-    let layout = project(&[(wins[0], &strip, true)], VIEWPORT, NO_GAPS, &unit_frame);
+    let layout = project(
+        &[(wins[0], &strip, true, None)],
+        VIEWPORT,
+        NO_GAPS,
+        &unit_frame,
+    );
     let tiles = tiles_of(&layout, 0);
 
     assert_eq!(tiles.len(), 4);
@@ -139,12 +290,6 @@ fn test_overview_projects_stack_column_in_order() {
         "stack shares x-range"
     );
     assert!(b.max.y <= c.min.y, "stack top above bottom");
-    assert!(
-        tiles
-            .iter()
-            .all(|(_, rect)| VIEWPORT.contains(rect.min) && VIEWPORT.contains(rect.max)),
-        "tiles fit the viewport"
-    );
 }
 
 #[test]
@@ -155,14 +300,15 @@ fn test_overview_projects_rows_in_virtual_order_without_overlap() {
         strip.append(wins[index as usize]);
         strip
     });
+    // Given out of order; the active row is VW1, the middle one once sorted.
     let rows = [
-        (wins[0], &strips[0], false),
-        (wins[1], &strips[1], true),
-        (wins[2], &strips[2], false),
+        (wins[0], &strips[0], false, None),
+        (wins[1], &strips[1], false, None),
+        (wins[2], &strips[2], true, None),
     ];
     let config = OverviewConfig {
         row_gap: 24,
-        label_height: 20,
+        zoom: 0.5,
     };
 
     let layout = project(&rows, VIEWPORT, config, &unit_frame);
@@ -176,13 +322,14 @@ fn test_overview_projects_rows_in_virtual_order_without_overlap() {
             .collect::<Vec<_>>(),
         vec![0, 1, 2]
     );
+    assert!(layout.rows[1].is_active);
+    assert_eq!(layout.rows[1].band.center().y, VIEWPORT.center().y);
     for pair in layout.rows.windows(2) {
         assert!(pair[0].band.max.y < pair[1].band.min.y, "bands overlap");
-    }
-    for row in &layout.rows {
-        let tile = row.tiles[0].target;
-        assert!(tile.min.y >= row.band.min.y + config.label_height);
-        assert!(tile.max.y <= row.band.max.y);
+        assert_eq!(
+            pair[1].band.min.y - pair[0].band.min.y,
+            300 + config.row_gap
+        );
     }
 }
 
@@ -200,13 +347,34 @@ fn test_overview_parked_row_projects_like_active_row() {
         Some(IRect::from_corners(min, min + IVec2::new(400, 600)))
     };
 
-    let visible = project(&[(wins[0], &strip, true)], VIEWPORT, NO_GAPS, &unit_frame);
-    let parked_layout = project(&[(wins[0], &strip, false)], VIEWPORT, NO_GAPS, &parked);
+    let visible = project(
+        &[(wins[0], &strip, true, Some(wins[1]))],
+        VIEWPORT,
+        NO_GAPS,
+        &unit_frame,
+    );
+    let parked_layout = project(
+        &[(wins[0], &strip, false, Some(wins[1]))],
+        VIEWPORT,
+        NO_GAPS,
+        &parked,
+    );
 
     assert_eq!(tiles_of(&visible, 0), tiles_of(&parked_layout, 0));
+    // The lone row is the vertical anchor (k = 0), so at full size it fills the
+    // viewport from the top, centred on window 1 — not the parked corner.
+    let origins = parked_layout.rows[0]
+        .tiles
+        .iter()
+        .map(|tile| tile.origin)
+        .collect::<Vec<_>>();
     assert_eq!(
-        parked_layout.rows[0].tiles[0].origin.min, parked_corner,
-        "origin is the real, parked frame"
+        origins,
+        vec![
+            IRect::new(-100, 0, 300, 600),
+            IRect::new(300, 0, 700, 600),
+            IRect::new(700, 0, 1100, 600),
+        ]
     );
 }
 
@@ -227,13 +395,23 @@ fn test_overview_scrolled_column_projects_at_strip_position() {
         }
     };
 
-    let layout = project(&[(wins[0], &strip, true)], VIEWPORT, NO_GAPS, &slivered);
+    let layout = project(
+        &[(wins[0], &strip, true, None)],
+        VIEWPORT,
+        NO_GAPS,
+        &slivered,
+    );
     let tiles = tiles_of(&layout, 0);
 
     assert_eq!(
         tiles,
         tiles_of(
-            &project(&[(wins[0], &strip, true)], VIEWPORT, NO_GAPS, &unit_frame),
+            &project(
+                &[(wins[0], &strip, true, None)],
+                VIEWPORT,
+                NO_GAPS,
+                &unit_frame
+            ),
             0
         )
     );
@@ -248,7 +426,12 @@ fn test_overview_empty_strip_yields_empty_band() {
     let wins = entities(1);
     let strip = LayoutStrip::new(1, 0);
 
-    let layout = project(&[(wins[0], &strip, true)], VIEWPORT, NO_GAPS, &unit_frame);
+    let layout = project(
+        &[(wins[0], &strip, true, None)],
+        VIEWPORT,
+        NO_GAPS,
+        &unit_frame,
+    );
 
     assert_eq!(layout.rows.len(), 1);
     assert!(layout.rows[0].tiles.is_empty());
@@ -264,7 +447,10 @@ fn test_overview_fullscreen_and_tabs_are_one_tile() {
     tabbed.append_tab_group(&wins[1..4]);
 
     let layout = project(
-        &[(wins[0], &fullscreen, true), (wins[1], &tabbed, false)],
+        &[
+            (wins[0], &fullscreen, true, None),
+            (wins[1], &tabbed, false, None),
+        ],
         VIEWPORT,
         NO_GAPS,
         &unit_frame,
@@ -284,7 +470,7 @@ fn test_overview_zero_width_frames_do_not_panic() {
     strip.append(wins[0]);
     strip.append(wins[1]);
 
-    let layout = project(&[(wins[0], &strip, true)], VIEWPORT, NO_GAPS, &|_| {
+    let layout = project(&[(wins[0], &strip, true, None)], VIEWPORT, NO_GAPS, &|_| {
         Some(IRect::new(0, 0, 0, 0))
     });
 
