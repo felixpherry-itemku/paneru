@@ -300,12 +300,19 @@ the active display changes, and will not open while Mission Control is showing.
 
 The backdrop is the display's desktop picture (or a solid `scrim_color` when
 there is no still image), dimmed by `scrim_opacity`, so no window shows through.
+When the picture's file can't be read (moved or deleted), the overview captures
+the desktop picture macOS is showing instead. That needs the same Screen
+Recording permission and `thumbnails = true` as thumbnails; without them the
+backdrop is `scrim_color`.
+
+The overview zooms and slides on niri's critically damped springs: opening,
+closing and sliding within a row at stiffness 800, switching rows at 1000.
+Leaving `options.animation_speed` unset makes it instant.
 
 The optional `[overview]` table tunes it:
 
 ```toml
 [overview]
-animation_speed = 14.0         # zoom and slide speed; defaults to options.animation_speed
 scrim_opacity = 0.3            # dims the wallpaper behind the rows (0.0 - 1.0)
 scrim_color = [0.05, 0.05, 0.07] # dim colour; the backdrop if there's no wallpaper
 zoom = 0.5                     # size of each workspace row relative to the screen (0.1 - 0.75)
@@ -317,6 +324,7 @@ thumbnails = true              # capture window thumbnails (see below)
 (System Settings → Privacy & Security → Screen & System Audio Recording). This
 is the only feature in Paneru that needs more than Accessibility. Without it —
 or with `thumbnails = false` — tiles show the app icon and window title instead,
+the backdrop falls back to `scrim_color` if the wallpaper file is unreadable,
 and nothing else changes. As with Accessibility, a locally rebuilt, ad-hoc
 signed binary loses the grant on every build.
 
