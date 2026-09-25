@@ -644,6 +644,7 @@ fn overview_render(
                     .and_then(|window| window.pid().ok())
                     .unwrap_or_default(),
                 frame: tile.drawn(overview.progress, overview.slide),
+                target: tile.target,
                 title: window
                     .and_then(|window| window.title().ok())
                     .unwrap_or_default(),

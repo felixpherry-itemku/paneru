@@ -1,24 +1,23 @@
 //! The overview's on-screen half: a plain-data [`OverviewScene`] built by the
-//! ECS each frame, and the [`OverviewRenderer`] that draws it in a borderless
-//! window above every application.
+//! ECS each frame, and the [`OverviewRenderer`] that shows it as a Core
+//! Animation layer tree in a borderless window above every application.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use bevy::math::{IRect, IVec2};
-use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSBezierPath, NSColor, NSCompositingOperation, NSFont, NSGraphicsContext, NSImage,
-    NSParagraphStyle, NSRunningApplication, NSScreen, NSScreenSaverWindowLevel, NSView, NSWindow,
+    NSFont, NSImage, NSRunningApplication, NSScreen, NSScreenSaverWindowLevel, NSView, NSWindow,
     NSWorkspace,
 };
-use objc2_core_foundation::CGFloat;
-use objc2_core_graphics::{CGBitmapContextCreateImage, CGDirectDisplayID};
-use objc2_foundation::{
-    NSAttributedString, NSDictionary, NSMutableCopying, NSPoint, NSRect, NSSize, NSString,
+use objc2_core_foundation::{CFRetained, CFType, CGFloat};
+use objc2_core_graphics::{CGBitmapContextCreateImage, CGColor, CGDirectDisplayID};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_quartz_core::{
+    CALayer, CATextLayer, CATransaction, kCAAlignmentCenter, kCAGravityResize,
+    kCAGravityResizeAspect, kCAGravityResizeAspectFill, kCATruncationEnd,
 };
 
 use super::{cg_abs_to_cocoa, make_overlay_window, primary_screen_height};
@@ -51,6 +50,9 @@ pub struct SceneTile {
     /// Absolute CG coordinates, already interpolated for `progress` and the
     /// slide.
     pub frame: IRect,
+    /// Where `frame` settles once open, in absolute CG coordinates. Known from
+    /// the first frame of the open.
+    pub target: IRect,
     pub title: String,
     pub tab_count: usize,
     pub hovered: bool,
@@ -68,211 +70,138 @@ fn local_rect(rect: IRect, origin: IVec2) -> NSRect {
     ns_rect(IRect::from_corners(rect.min - origin, rect.max - origin))
 }
 
-fn srgb(rgb: [f64; 3], alpha: f64) -> Retained<NSColor> {
-    NSColor::colorWithSRGBRed_green_blue_alpha(
-        rgb[0] as CGFloat,
-        rgb[1] as CGFloat,
-        rgb[2] as CGFloat,
-        alpha as CGFloat,
-    )
+fn srgb(rgb: [f64; 3], alpha: f64) -> CFRetained<CGColor> {
+    CGColor::new_srgb(rgb[0], rgb[1], rgb[2], alpha)
+}
+
+/// Runs `changes` with Core Animation's implicit animations off. Otherwise
+/// every frame, contents and opacity change gets its own 0.25 s tween,
+/// fighting the zoom's ease-out.
+fn without_animation(changes: impl FnOnce()) {
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    changes();
+    CATransaction::commit();
 }
 
 const WHITE: [f64; 3] = [1.0, 1.0, 1.0];
-
-/// Draws `text` inside `rect` on one line, truncating the tail, either centred
-/// or left-aligned. Same attributed-string idiom as `FlashMessageView`.
-fn draw_text(text: &str, rect: NSRect, font: &NSFont, color: &NSColor, centered: bool) {
-    let paragraph_style = unsafe {
-        let style = NSParagraphStyle::defaultParagraphStyle().mutableCopy();
-        // NSTextAlignmentLeft = 0, NSTextAlignmentCenter = 1.
-        let _: () = msg_send![&style, setAlignment: isize::from(centered)];
-        let _: () = msg_send![&style, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
-        style
-    };
-    let font_key = NSString::from_str("NSFont");
-    let color_key = NSString::from_str("NSColor");
-    let para_key = NSString::from_str("NSParagraphStyle");
-    let keys = [&*font_key, &*color_key, &*para_key];
-    let objects = [
-        font as &AnyObject,
-        color as &AnyObject,
-        &*paragraph_style as &AnyObject,
-    ];
-    let attributes = NSDictionary::from_slices(&keys, &objects);
-    let message = NSString::from_str(text);
-    unsafe {
-        let string: Retained<NSAttributedString> = msg_send![
-            NSAttributedString::alloc(),
-            initWithString: &*message,
-            attributes: &*attributes
-        ];
-        let _: () = msg_send![&string, drawInRect: rect];
-    }
-}
 
 const TILE_FILL: [f64; 3] = [0.16, 0.16, 0.18];
 const TILE_RADIUS: CGFloat = 10.0;
 const TITLE_FONT_SIZE: CGFloat = 12.0;
 
-/// Draws `image` over the whole of `rect` at `alpha`.
-fn draw_image(image: &NSImage, rect: NSRect, alpha: f64) {
-    unsafe {
-        image.drawInRect_fromRect_operation_fraction_respectFlipped_hints(
-            rect,
-            NSRect::ZERO,
-            NSCompositingOperation::SourceOver,
-            alpha,
-            true,
-            None,
-        );
-    }
+/// One tile's layers: a rounded card holding the window's live `content` once
+/// a frame has arrived, and until then the app icon with the title beneath it.
+#[derive(Clone)]
+struct TileLayers {
+    card: Retained<CALayer>,
+    content: Retained<CALayer>,
+    icon: Retained<CALayer>,
+    title: Retained<CATextLayer>,
 }
 
-/// Where to draw `image` so it covers `bounds` at its own aspect ratio:
-/// scaled up or down to fill, centred, overflowing on one axis.
-fn aspect_fill(image: NSSize, bounds: NSRect) -> NSRect {
-    if image.width <= 0.0 || image.height <= 0.0 {
-        return bounds;
+impl TileLayers {
+    /// `scale` is the display's backing scale, for crisp icon and text.
+    fn new(pid: Pid, scale: CGFloat) -> Self {
+        let card = CALayer::new();
+        card.setBackgroundColor(Some(&srgb(TILE_FILL, 0.92)));
+        card.setMasksToBounds(true);
+
+        let content = CALayer::new();
+        content.setContentsGravity(unsafe { kCAGravityResize });
+        content.setHidden(true);
+
+        let icon = CALayer::new();
+        icon.setContentsGravity(unsafe { kCAGravityResizeAspect });
+        icon.setContentsScale(scale);
+        if let Some(image) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+            .and_then(|app| app.icon())
+        {
+            // SAFETY: an `NSImage` is one of the types `contents` takes.
+            unsafe { icon.setContents(Some(&image)) };
+        }
+
+        let title = CATextLayer::new();
+        let font = NSFont::systemFontOfSize(TITLE_FONT_SIZE);
+        // SAFETY: `NSFont` is toll-free bridged with `CTFont`, one of the
+        // types `font` takes.
+        unsafe { title.setFont(Some(&*Retained::as_ptr(&font).cast::<CFType>())) };
+        title.setFontSize(TITLE_FONT_SIZE);
+        title.setForegroundColor(Some(&srgb(WHITE, 0.9)));
+        title.setAlignmentMode(unsafe { kCAAlignmentCenter });
+        title.setTruncationMode(unsafe { kCATruncationEnd });
+        title.setContentsScale(scale);
+
+        card.addSublayer(&content);
+        card.addSublayer(&icon);
+        card.addSublayer(&title);
+        Self {
+            card,
+            content,
+            icon,
+            title,
+        }
     }
-    let scale = (bounds.size.width / image.width).max(bounds.size.height / image.height);
-    let size = NSSize::new(image.width * scale, image.height * scale);
-    NSRect::new(
-        NSPoint::new(
-            bounds.origin.x + (bounds.size.width - size.width) / 2.0,
-            bounds.origin.y + (bounds.size.height - size.height) / 2.0,
-        ),
-        size,
-    )
-}
 
-/// One window: its captured thumbnail if one has arrived, otherwise a rounded
-/// card with the app icon centred and the title beneath it.
-fn draw_tile(
-    tile: &SceneTile,
-    icon: Option<&NSImage>,
-    thumbnail: Option<&NSImage>,
-    origin: IVec2,
-    progress: f64,
-) {
-    let rect = local_rect(tile.frame, origin);
-    if rect.size.width < 1.0 || rect.size.height < 1.0 {
-        return;
-    }
-    let radius = TILE_RADIUS
-        .min(rect.size.width / 2.0)
-        .min(rect.size.height / 2.0);
-    let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, radius, radius);
-    srgb(TILE_FILL, 0.92 * progress).setFill();
-    path.fill();
-    let (alpha, width) = if tile.hovered {
-        (0.5 * progress, 2.0)
-    } else {
-        (0.18 * progress, 1.0)
-    };
-    path.setLineWidth(width);
-    srgb(WHITE, alpha).setStroke();
+    /// Places the card at `tile`'s drawn frame and lays out what's in it.
+    fn layout(&self, tile: &SceneTile, origin: IVec2) {
+        let rect = local_rect(tile.frame, origin);
+        let NSSize { width, height } = rect.size;
+        self.card.setHidden(width < 1.0 || height < 1.0);
+        self.card.setFrame(rect);
+        self.card
+            .setCornerRadius(TILE_RADIUS.min(width / 2.0).min(height / 2.0));
+        let (alpha, border) = if tile.hovered {
+            (0.5, 2.0)
+        } else {
+            (0.18, 1.0)
+        };
+        self.card.setBorderColor(Some(&srgb(WHITE, alpha)));
+        self.card.setBorderWidth(border);
+        self.content.setFrame(NSRect::new(NSPoint::ZERO, rect.size));
 
-    if let Some(thumbnail) = thumbnail
-        && let Some(context) = NSGraphicsContext::currentContext()
-    {
-        context.saveGraphicsState();
-        path.addClip();
-        draw_image(thumbnail, rect, progress);
-        context.restoreGraphicsState();
-        path.stroke();
-        return;
-    }
-    path.stroke();
-
-    let title_height = TITLE_FONT_SIZE * 1.5;
-    let gap = 6.0;
-    let icon_size = 64.0_f64
-        .min(rect.size.width * 0.5)
-        .min((rect.size.height - title_height - gap) * 0.6)
-        .max(0.0);
-    let content_height = icon_size + gap + title_height;
-    let top = rect.origin.y + (rect.size.height - content_height).max(0.0) / 2.0;
-
-    if let Some(icon) = icon
-        && icon_size >= 8.0
-    {
-        let icon_rect = NSRect::new(
-            NSPoint::new(rect.origin.x + (rect.size.width - icon_size) / 2.0, top),
+        // The icon and title only stand in until the first frame.
+        let framed = !self.content.isHidden();
+        let title_height = TITLE_FONT_SIZE * 1.5;
+        let gap = 6.0;
+        let icon_size = 64.0_f64
+            .min(width * 0.5)
+            .min((height - title_height - gap) * 0.6)
+            .max(0.0);
+        let top = (height - (icon_size + gap + title_height)).max(0.0) / 2.0;
+        self.icon.setHidden(framed || icon_size < 8.0);
+        self.icon.setFrame(NSRect::new(
+            NSPoint::new((width - icon_size) / 2.0, top),
             NSSize::new(icon_size, icon_size),
-        );
-        draw_image(icon, icon_rect, progress);
+        ));
+
+        let caption = if tile.tab_count > 1 {
+            format!("{} · {} tabs", tile.title, tile.tab_count)
+        } else {
+            tile.title.clone()
+        };
+        let padding = 8.0;
+        self.title.setHidden(framed);
+        self.title.setFrame(NSRect::new(
+            NSPoint::new(padding, top + icon_size + gap),
+            NSSize::new((width - 2.0 * padding).max(1.0), title_height),
+        ));
+        // SAFETY: an `NSString` is one of the types `string` takes.
+        unsafe { self.title.setString(Some(&NSString::from_str(&caption))) };
     }
-
-    let caption = if tile.tab_count > 1 {
-        format!("{} · {} tabs", tile.title, tile.tab_count)
-    } else {
-        tile.title.clone()
-    };
-    let padding = 8.0;
-    let title_rect = NSRect::new(
-        NSPoint::new(rect.origin.x + padding, top + icon_size + gap),
-        NSSize::new((rect.size.width - 2.0 * padding).max(1.0), title_height),
-    );
-    let font = NSFont::systemFontOfSize(TITLE_FONT_SIZE);
-    draw_text(
-        &caption,
-        title_rect,
-        &font,
-        &srgb(WHITE, 0.9 * progress),
-        true,
-    );
-}
-
-// ── OverviewView ────────────────────────────────────────────────────────
-
-#[derive(Debug, Default)]
-struct OverviewViewState {
-    scene: OverviewScene,
-    icons: HashMap<Pid, Retained<NSImage>>,
-    /// Window captures, filled in as they arrive. Dropped with the view when
-    /// the overview closes: a stale thumbnail is worse than a placeholder.
-    thumbnails: HashMap<WinID, Retained<NSImage>>,
-    /// The display's desktop picture, if it has a still one.
-    wallpaper: Option<Retained<NSImage>>,
 }
 
 define_class!(
+    /// A view that only says it is flipped. AppKit keeps a hosted layer's
+    /// `geometryFlipped` in step with `isFlipped`, resetting it on `setLayer`
+    /// and every resize, so the top-left origin `local_rect` produces has to
+    /// come from here rather than from the layer.
     #[unsafe(super(NSView))]
     #[thread_kind = MainThreadOnly]
     #[name = "PaneruOverviewView"]
-    #[ivars = RefCell<OverviewViewState>]
-    #[derive(Debug)]
     struct OverviewView;
 
     impl OverviewView {
-        #[unsafe(method(drawRect:))]
-        fn draw_rect(&self, _dirty_rect: NSRect) {
-            let state = self.ivars().borrow();
-            let scene = &state.scene;
-            let progress = f64::from(scene.progress);
-            let bounds = self.bounds();
-
-            // Opaque once open either way, so no live window shows through.
-            // ponytail: a full-size wallpaper is rescaled on every frame of the
-            // zoom; if that stutters, pre-render it once at display size with
-            // `rgba_bitmap_context` + `CGBitmapContextCreateImage` and cache it.
-            if let Some(wallpaper) = &state.wallpaper {
-                draw_image(wallpaper, aspect_fill(wallpaper.size(), bounds), progress);
-            } else {
-                srgb(scene.scrim_color, progress).setFill();
-                NSBezierPath::fillRect(bounds);
-            }
-            srgb(scene.scrim_color, f64::from(scene.scrim_opacity) * progress).setFill();
-            NSBezierPath::fillRect(bounds);
-
-            let origin = scene.display.min;
-            for tile in &scene.tiles {
-                let icon = state.icons.get(&tile.pid).map(|icon| &**icon);
-                let thumbnail = state.thumbnails.get(&tile.window_id).map(|image| &**image);
-                draw_tile(tile, icon, thumbnail, origin, progress);
-            }
-        }
-
         #[unsafe(method(isFlipped))]
         fn is_flipped(&self) -> bool {
             true
@@ -282,8 +211,54 @@ define_class!(
 
 impl OverviewView {
     fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(RefCell::default());
+        let this = Self::alloc(mtm).set_ivars(());
         unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+}
+
+/// The overview window and the layers under its tiles. `host` is the content
+/// view's layer, so the backdrop, the scrim and every tile are plain sublayers
+/// drawn by Core Animation.
+struct Stage {
+    window: Retained<NSWindow>,
+    host: Retained<CALayer>,
+    /// Opaque either way, so no live window shows through: the desktop
+    /// picture when there is one, over the scrim colour.
+    backdrop: Retained<CALayer>,
+    scrim: Retained<CALayer>,
+}
+
+impl Stage {
+    fn new(mtm: MainThreadMarker, frame: NSRect) -> Self {
+        let window = make_overlay_window(mtm, frame);
+        // Above every application window, the menu bar and the Dock.
+        window.setLevel(NSScreenSaverWindowLevel);
+        // Hit-tested like any window, so the event tap can tell whether a
+        // click lands on the overview or on something drawn above it. The
+        // tap consumes the clicks it takes, so the window never becomes
+        // key and never activates Paneru.
+        window.setIgnoresMouseEvents(false);
+        let host = CALayer::new();
+        let view = OverviewView::new(mtm, NSRect::new(NSPoint::ZERO, frame.size));
+        // Layer-hosting, not layer-backed: `setLayer` first, so AppKit leaves
+        // the tree to us rather than making and owning a layer of its own.
+        view.setLayer(Some(&host));
+        view.setWantsLayer(true);
+        window.setContentView(Some(&view));
+        let backdrop = CALayer::new();
+        backdrop.setContentsGravity(unsafe { kCAGravityResizeAspectFill });
+        backdrop.setMasksToBounds(true);
+        host.addSublayer(&backdrop);
+        let scrim = CALayer::new();
+        host.addSublayer(&scrim);
+        window.orderFront(None::<&AnyObject>);
+        set_overview_window(window.windowNumber());
+        Self {
+            window,
+            host,
+            backdrop,
+            scrim,
+        }
     }
 }
 
@@ -307,7 +282,7 @@ fn rgba_image(width: u32, height: u32, mut rgba: Vec<u8>) -> Option<Retained<NSI
 /// while the overview is open.
 pub struct OverviewRenderer {
     mtm: MainThreadMarker,
-    window: Option<(Retained<NSWindow>, Retained<OverviewView>)>,
+    window: Option<Stage>,
     scene: Option<OverviewScene>,
     /// Where captured wallpapers are delivered.
     #[cfg_attr(not(feature = "thumbnails"), allow(dead_code))]
@@ -321,9 +296,8 @@ pub struct OverviewRenderer {
     /// The display whose captured picture this open shows, so a capture
     /// arriving for it replaces the backdrop.
     awaiting: Option<CGDirectDisplayID>,
-    /// THROWAWAY Phase 1 probe (removed in Phase 3): live streams per window.
-    #[cfg(feature = "thumbnails")]
-    probe: HashMap<WinID, crate::manager::capture::LiveStream>,
+    /// Each projected window's layers, created on its first frame.
+    tiles: HashMap<WinID, TileLayers>,
 }
 
 impl OverviewRenderer {
@@ -336,8 +310,7 @@ impl OverviewRenderer {
             wallpaper: None,
             captured: HashMap::new(),
             awaiting: None,
-            #[cfg(feature = "thumbnails")]
-            probe: HashMap::new(),
+            tiles: HashMap::new(),
         }
     }
 
@@ -361,8 +334,6 @@ impl OverviewRenderer {
 
     /// Shows `scene`, creating the window on first use. A no-op when the scene
     /// matches the last one drawn.
-    // THROWAWAY Phase 1 probe pushes this over the limit; gone in Phase 3.
-    #[allow(clippy::too_many_lines)]
     pub fn render(&mut self, scene: OverviewScene) {
         if self.scene.as_ref() == Some(&scene) {
             return;
@@ -378,43 +349,55 @@ impl OverviewRenderer {
             self.awaiting = file.is_none().then_some(scene.display_id);
             file.or_else(|| self.captured.get(&scene.display_id).cloned())
         });
-        let (window, view) = self.window.get_or_insert_with(|| {
-            let window = make_overlay_window(self.mtm, frame);
-            // Above every application window, the menu bar and the Dock.
-            window.setLevel(NSScreenSaverWindowLevel);
-            // Hit-tested like any window, so the event tap can tell whether a
-            // click lands on the overview or on something drawn above it. The
-            // tap consumes the clicks it takes, so the window never becomes
-            // key and never activates Paneru.
-            window.setIgnoresMouseEvents(false);
-            let view = OverviewView::new(self.mtm, NSRect::new(NSPoint::ZERO, frame.size));
-            window.setContentView(Some(&view));
-            window.orderFront(None::<&AnyObject>);
-            set_overview_window(window.windowNumber());
-            (window, view)
-        });
+        let mtm = self.mtm;
+        let stage = self.window.get_or_insert_with(|| Stage::new(mtm, frame));
         if resized {
-            window.setFrame_display(frame, false);
+            stage.window.setFrame_display(frame, false);
         }
-
-        {
-            let mut state = view.ivars().borrow_mut();
-            if let Some(wallpaper) = wallpaper {
-                state.wallpaper = wallpaper;
+        let scale = stage.window.backingScaleFactor();
+        let bounds = NSRect::new(NSPoint::ZERO, frame.size);
+        without_animation(|| {
+            // Fades everything together, as one group.
+            stage.host.setOpacity(scene.progress);
+            stage.backdrop.setFrame(bounds);
+            let opaque = srgb(scene.scrim_color, 1.0);
+            stage.backdrop.setBackgroundColor(Some(&opaque));
+            if let Some(wallpaper) = &wallpaper {
+                // SAFETY: an `NSImage` is one of the types `contents` takes.
+                unsafe {
+                    stage
+                        .backdrop
+                        .setContents(wallpaper.as_deref().map(AsRef::as_ref));
+                }
             }
-            for tile in &scene.tiles {
-                state.icons.entry(tile.pid).or_insert_with(|| {
-                    NSRunningApplication::runningApplicationWithProcessIdentifier(tile.pid)
-                        .and_then(|app| app.icon())
-                        .unwrap_or_default()
+            stage.scrim.setFrame(bounds);
+            let scrim = srgb(scene.scrim_color, f64::from(scene.scrim_opacity));
+            stage.scrim.setBackgroundColor(Some(&scrim));
+
+            // Later tiles on top.
+            for (tile, z) in scene.tiles.iter().zip(0_u32..) {
+                // No window behind it: nothing to key its layers by.
+                if tile.window_id == 0 {
+                    continue;
+                }
+                let layers = self.tiles.entry(tile.window_id).or_insert_with(|| {
+                    let layers = TileLayers::new(tile.pid, scale);
+                    stage.host.addSublayer(&layers.card);
+                    layers
                 });
+                layers.card.setZPosition(f64::from(z));
+                layers.layout(tile, scene.display.min);
             }
-            state.scene = scene.clone();
-        }
-        view.setNeedsDisplay(true);
+            // A window closed while the overview is open.
+            self.tiles.retain(|id, layers| {
+                let projected = scene.tiles.iter().any(|tile| tile.window_id == *id);
+                if !projected {
+                    layers.card.removeFromSuperlayer();
+                }
+                projected
+            });
+        });
 
-        #[cfg(feature = "thumbnails")]
-        let scale = window.backingScaleFactor();
         #[cfg(feature = "thumbnails")]
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let pixels = |points: i32| (f64::from(points) * scale).round().max(1.0) as u32;
@@ -430,54 +413,6 @@ impl OverviewRenderer {
             );
         }
 
-        // THROWAWAY Phase 1 probe (removed in Phase 3): once settled, stream
-        // each tile into a plain sublayer, to see whether covered windows keep
-        // updating.
-        #[cfg(feature = "thumbnails")]
-        if scene.thumbnails && scene.progress >= 1.0 {
-            use crate::manager::capture::{FrameSink, start_streams};
-            use dispatch2::MainThreadBound;
-            use objc2_io_surface::IOSurfaceRef;
-            use objc2_quartz_core::{CALayer, CATransaction};
-            use std::sync::Arc;
-
-            view.setWantsLayer(true);
-            if let Some(host) = view.layer() {
-                let height = view.bounds().size.height;
-                let flipped = host.isGeometryFlipped();
-                let mut requests = Vec::new();
-                for tile in &scene.tiles {
-                    if tile.window_id == 0 || self.probe.contains_key(&tile.window_id) {
-                        continue;
-                    }
-                    let mut rect = local_rect(tile.frame, scene.display.min);
-                    if !flipped {
-                        rect.origin.y = height - rect.origin.y - rect.size.height;
-                    }
-                    let layer = CALayer::new();
-                    layer.setFrame(rect);
-                    host.addSublayer(&layer);
-                    let sink: FrameSink = Arc::new(MainThreadBound::new(
-                        Box::new(move |surface: &IOSurfaceRef| {
-                            CATransaction::begin();
-                            CATransaction::setDisableActions(true);
-                            let contents = std::ptr::from_ref(surface).cast::<AnyObject>();
-                            unsafe { layer.setContents(Some(&*contents)) };
-                            CATransaction::commit();
-                        }),
-                        self.mtm,
-                    ));
-                    requests.push((
-                        tile.window_id,
-                        pixels(tile.frame.width()),
-                        pixels(tile.frame.height()),
-                        sink,
-                    ));
-                }
-                tracing::debug!(flipped, count = requests.len(), "overview probe streams");
-                self.probe.extend(start_streams(requests));
-            }
-        }
         self.scene = Some(scene);
     }
 
@@ -494,43 +429,22 @@ impl OverviewRenderer {
             return;
         };
         self.captured.insert(display_id, image.clone());
-        if let Some((_, view)) = &self.window
+        if let Some(stage) = &self.window
             && self.awaiting == Some(display_id)
         {
-            view.ivars().borrow_mut().wallpaper = Some(image);
-            view.setNeedsDisplay(true);
+            // SAFETY: an `NSImage` is one of the types `contents` takes.
+            without_animation(|| unsafe { stage.backdrop.setContents(Some(&image)) });
         }
     }
 
     /// Takes the window down and forgets everything drawn in it.
     pub fn close(&mut self) {
-        #[cfg(feature = "thumbnails")]
-        self.probe.clear();
         set_overview_window(0);
-        if let Some((window, view)) = self.window.take() {
-            window.orderOut(None::<&AnyObject>);
-            // Explicitly, rather than trusting AppKit to free the view with
-            // the window: a stale thumbnail is worse than a placeholder.
-            *view.ivars().borrow_mut() = OverviewViewState::default();
+        if let Some(stage) = self.window.take() {
+            stage.window.orderOut(None::<&AnyObject>);
         }
+        self.tiles.clear();
         self.scene = None;
         self.awaiting = None;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[allow(clippy::float_cmp, reason = "exact binary fractions")]
-    fn wide_wallpaper_fills_the_height_and_overflows_the_width_centred() {
-        let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1000.0, 800.0));
-        let rect = aspect_fill(NSSize::new(3000.0, 1000.0), bounds);
-        assert_eq!(rect.size.height, 800.0);
-        assert_eq!(rect.size.width, 2400.0);
-        assert_eq!(rect.origin.x, -700.0);
-        assert_eq!(rect.origin.y, 0.0);
-        assert_eq!(aspect_fill(NSSize::new(0.0, 0.0), bounds), bounds);
     }
 }
