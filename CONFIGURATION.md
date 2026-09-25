@@ -305,14 +305,11 @@ the desktop picture macOS is showing instead. That needs the same Screen
 Recording permission and `thumbnails = true` as thumbnails; without them the
 backdrop is `scrim_color`.
 
-The overview zooms and slides on niri's critically damped springs: opening,
-closing and sliding within a row at stiffness 800, switching rows at 1000.
-Leaving `options.animation_speed` unset makes it instant.
-
 The optional `[overview]` table tunes it:
 
 ```toml
 [overview]
+animation_speed = 14.0         # zoom and slide speed; defaults to options.animation_speed
 scrim_opacity = 0.3            # dims the wallpaper behind the rows (0.0 - 1.0)
 scrim_color = [0.05, 0.05, 0.07] # dim colour; the backdrop if there's no wallpaper
 zoom = 0.5                     # size of each workspace row relative to the screen (0.1 - 0.75)
