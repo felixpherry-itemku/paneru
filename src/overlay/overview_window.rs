@@ -3,7 +3,7 @@
 //! window above every application.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use bevy::math::{IRect, IVec2};
 use objc2::AnyThread;
@@ -309,11 +309,9 @@ pub struct OverviewRenderer {
     mtm: MainThreadMarker,
     window: Option<(Retained<NSWindow>, Retained<OverviewView>)>,
     scene: Option<OverviewScene>,
-    /// Where captured thumbnails are delivered.
+    /// Where captured wallpapers are delivered.
     #[cfg_attr(not(feature = "thumbnails"), allow(dead_code))]
     events: EventSender,
-    /// Windows a capture was already asked for during this open.
-    requested: HashSet<WinID>,
     /// The last desktop picture decoded, keyed by its URL. Kept across opens,
     /// so only the first open pays for decoding it.
     wallpaper: Option<(String, Retained<NSImage>)>,
@@ -335,7 +333,6 @@ impl OverviewRenderer {
             window: None,
             scene: None,
             events,
-            requested: HashSet::new(),
             wallpaper: None,
             captured: HashMap::new(),
             awaiting: None,
@@ -416,10 +413,12 @@ impl OverviewRenderer {
         }
         view.setNeedsDisplay(true);
 
+        #[cfg(feature = "thumbnails")]
         let scale = window.backingScaleFactor();
+        #[cfg(feature = "thumbnails")]
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let pixels = |points: i32| (f64::from(points) * scale).round().max(1.0) as u32;
-        // Right away, unlike thumbnails: the capture overlaps the fade-in.
+        // Right away: the capture overlaps the fade-in.
         #[cfg(feature = "thumbnails")]
         if first && scene.thumbnails && self.awaiting == Some(scene.display_id) {
             crate::manager::capture::request_wallpaper(
@@ -429,28 +428,6 @@ impl OverviewRenderer {
                 pixels(scene.display.height()),
                 self.events.clone(),
             );
-        }
-
-        // Only once the window is up and settled: a slow capture round-trip
-        // must never hold up the open animation, and settled tiles have their
-        // final size to capture at.
-        if scene.thumbnails && scene.progress >= 1.0 {
-            let requests = scene
-                .tiles
-                .iter()
-                .filter(|tile| self.requested.insert(tile.window_id))
-                .map(|tile| {
-                    (
-                        tile.window_id,
-                        pixels(tile.frame.width()),
-                        pixels(tile.frame.height()),
-                    )
-                })
-                .collect::<Vec<_>>();
-            #[cfg(feature = "thumbnails")]
-            crate::manager::capture::request_thumbnails(requests, self.events.clone());
-            #[cfg(not(feature = "thumbnails"))]
-            drop(requests);
         }
 
         // THROWAWAY Phase 1 probe (removed in Phase 3): once settled, stream
@@ -504,21 +481,6 @@ impl OverviewRenderer {
         self.scene = Some(scene);
     }
 
-    /// Caches a captured thumbnail.
-    pub fn store_thumbnail(&mut self, window_id: WinID, width: u32, height: u32, rgba: Vec<u8>) {
-        let Some((_, view)) = &self.window else {
-            return;
-        };
-        let Some(image) = rgba_image(width, height, rgba) else {
-            return;
-        };
-        view.ivars()
-            .borrow_mut()
-            .thumbnails
-            .insert(window_id, image);
-        view.setNeedsDisplay(true);
-    }
-
     /// Caches a captured desktop picture, and shows it if this open is
     /// waiting for one of that display.
     pub fn store_wallpaper(
@@ -552,7 +514,6 @@ impl OverviewRenderer {
             *view.ivars().borrow_mut() = OverviewViewState::default();
         }
         self.scene = None;
-        self.requested.clear();
         self.awaiting = None;
     }
 }

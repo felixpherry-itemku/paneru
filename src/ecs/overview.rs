@@ -378,7 +378,7 @@ impl Plugin for OverviewPlugin {
             PreUpdate,
             (
                 overview_toggle,
-                (overview_input, overview_thumbnail)
+                (overview_input, overview_wallpaper)
                     .after(overview_toggle)
                     .distributive_run_if(resource_exists::<Overview>),
             ),
@@ -745,51 +745,23 @@ fn finish_close(
     commands.remove_resource::<Overview>();
 }
 
-/// Hands arriving thumbnails and wallpaper captures to the renderer. A
-/// thumbnail for a window that is no longer projected — closed since the
-/// capture was requested — is dropped.
+/// Hands arriving wallpaper captures to the renderer, which knows which
+/// display's capture this open is waiting for.
 #[instrument(level = Level::DEBUG, skip_all)]
-fn overview_thumbnail(
+fn overview_wallpaper(
     mut messages: MessageReader<Event>,
-    overview: Res<Overview>,
-    windows: Windows,
-    renderer: Option<NonSendMut<OverviewRenderer>>,
+    mut renderer: Option<NonSendMut<OverviewRenderer>>,
 ) {
-    let mut renderer = renderer;
     for event in messages.read() {
-        let Some(renderer) = renderer.as_mut() else {
-            continue;
-        };
-        match event {
-            Event::OverviewThumbnail {
-                window_id,
-                width,
-                height,
-                rgba,
-            } => {
-                let projected =
-                    overview
-                        .layout
-                        .rows
-                        .iter()
-                        .flat_map(|row| &row.tiles)
-                        .any(|tile| {
-                            windows
-                                .get(tile.entity)
-                                .is_some_and(|window| window.id() == *window_id)
-                        });
-                if projected {
-                    renderer.store_thumbnail(*window_id, *width, *height, rgba.clone());
-                }
-            }
-            // The renderer knows which display's capture it is waiting for.
-            Event::OverviewWallpaper {
+        if let Some(renderer) = renderer.as_mut()
+            && let Event::OverviewWallpaper {
                 display_id,
                 width,
                 height,
                 rgba,
-            } => renderer.store_wallpaper(*display_id, *width, *height, rgba.clone()),
-            _ => {}
+            } = event
+        {
+            renderer.store_wallpaper(*display_id, *width, *height, rgba.clone());
         }
     }
 }

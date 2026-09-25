@@ -1,5 +1,10 @@
-//! Window thumbnails and the desktop picture for the overview, captured with
+//! Live window streams and the desktop picture for the overview, captured with
 //! `ScreenCaptureKit`.
+//!
+//! Stream frames go from `ScreenCaptureKit`'s queue straight to the main queue
+//! and into the renderer's layers, never through ECS, so a settled overview
+//! leaves Bevy idle. The desktop picture is one still capture, sent as an
+//! event.
 //!
 //! Everything here is best effort: below macOS 14, without the Screen Recording
 //! permission, or for a window `ScreenCaptureKit` does not know, nothing arrives
@@ -37,7 +42,8 @@ use crate::util::rgba_bitmap_context;
 pub type FrameSink = Arc<MainThreadBound<Box<dyn Fn(&IOSurfaceRef)>>>;
 
 /// One window's live stream, running or still starting. Dropping it stops the
-/// stream, or keeps a still-starting one from ever running.
+/// stream, or keeps a still-starting one from ever running. Never waits on
+/// `ScreenCaptureKit`, so it is safe to drop on the main thread.
 pub struct LiveStream(Arc<Mutex<Slot>>);
 
 /// What a [`LiveStream`] shares with the completion handler that starts it.
@@ -76,6 +82,8 @@ struct SendSurface(CFRetained<IOSurfaceRef>);
 unsafe impl Send for SendSurface {}
 
 define_class!(
+    /// Receives one stream's samples and forwards each frame's surface to that
+    /// window's [`FrameSink`].
     // SAFETY:
     // - The superclass NSObject does not have any subclassing requirements.
     // - `StreamOutput` does not implement `Drop`.
@@ -134,9 +142,11 @@ fn stream_queue() -> &'static DispatchQueue {
 }
 
 /// Starts a live stream per `(window, pixel width, pixel height, sink)`, at
-/// most 30 frames per second. Returns the handles at once; the streams come up
-/// asynchronously, and a window `ScreenCaptureKit` can't see (or a denied
-/// permission) just never delivers a frame.
+/// most 30 frames per second, with one shareable-content lookup for all of
+/// them. Returns the handles at once; the streams come up asynchronously, and
+/// a window `ScreenCaptureKit` can't see (or a denied permission) just never
+/// delivers a frame. `ScreenCaptureKit` only sends a frame when the window's
+/// content changes, so an idle stream costs next to nothing.
 pub fn start_streams(requests: Vec<(WinID, u32, u32, FrameSink)>) -> Vec<(WinID, LiveStream)> {
     if requests.is_empty() || !objc2::available!(macos = 14.0) {
         return Vec::new();
@@ -155,6 +165,9 @@ pub fn start_streams(requests: Vec<(WinID, u32, u32, FrameSink)>) -> Vec<(WinID,
 
     let handler = RcBlock::new(
         move |content: *mut SCShareableContent, error: *mut NSError| {
+            // Null content is how a denied Screen Recording permission shows
+            // up. Not an error worth surfacing: the tiles already have their
+            // icon + title.
             let Some(content) = (unsafe { content.as_ref() }) else {
                 debug!("no shareable content: {:?}", unsafe { error.as_ref() });
                 return;
@@ -168,6 +181,8 @@ pub fn start_streams(requests: Vec<(WinID, u32, u32, FrameSink)>) -> Vec<(WinID,
                 else {
                     continue;
                 };
+                // Held until the stream is stored, so a drop racing this start
+                // either cancels it first or finds it to stop.
                 let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
                 if slot.cancelled {
                     continue;
@@ -217,66 +232,18 @@ pub fn start_streams(requests: Vec<(WinID, u32, u32, FrameSink)>) -> Vec<(WinID,
             }
         },
     );
-    // See `request_thumbnails` for why on-screen windows are enough.
+    // `onScreenWindowsOnly` still covers every managed window, including those
+    // the overview exists to reveal: a parked strip keeps `PARKED_STRIP_SLIVER`
+    // on screen and a scrolled-away column keeps `sliver_width`, precisely so
+    // macOS never treats them as hidden. That parking design is load-bearing
+    // here — a window pushed fully off-display would silently lose its
+    // stream.
     unsafe {
         SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
             true, true, &handler,
         );
     }
     live
-}
-
-/// Requests a thumbnail per `(window, pixel width, pixel height)`. Returns
-/// immediately; each result arrives later as an `Event::OverviewThumbnail`.
-pub fn request_thumbnails(requests: Vec<(WinID, u32, u32)>, events: EventSender) {
-    if requests.is_empty() || !objc2::available!(macos = 14.0) {
-        return;
-    }
-
-    let handler = RcBlock::new(
-        move |content: *mut SCShareableContent, error: *mut NSError| {
-            // Null content is how a denied Screen Recording permission shows
-            // up. Not an error worth surfacing: the tiles already have their
-            // icon + title.
-            let Some(content) = (unsafe { content.as_ref() }) else {
-                debug!("no shareable content: {:?}", unsafe { error.as_ref() });
-                return;
-            };
-            let by_id = unsafe { content.windows() }
-                .iter()
-                .map(|window| (unsafe { window.windowID() }, window))
-                .collect::<HashMap<u32, Retained<SCWindow>>>();
-            for &(window_id, width, height) in &requests {
-                let Some(window) = u32::try_from(window_id).ok().and_then(|id| by_id.get(&id))
-                else {
-                    continue;
-                };
-                capture(
-                    window,
-                    width,
-                    height,
-                    events.clone(),
-                    move |width, height, rgba| Event::OverviewThumbnail {
-                        window_id,
-                        width,
-                        height,
-                        rgba,
-                    },
-                );
-            }
-        },
-    );
-    // `onScreenWindowsOnly` still covers every managed window, including those
-    // the overview exists to reveal: a parked strip keeps `PARKED_STRIP_SLIVER`
-    // on screen and a scrolled-away column keeps `sliver_width`, precisely so
-    // macOS never treats them as hidden. That parking design is load-bearing
-    // here — a window pushed fully off-display would silently lose its
-    // thumbnail.
-    unsafe {
-        SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
-            true, true, &handler,
-        );
-    }
 }
 
 /// Requests the desktop picture macOS is showing on `display` (absolute CG

@@ -200,18 +200,10 @@ pub enum Event {
     /// A key pressed while the overview is open. The event tap swallows every
     /// key in that state and forwards it here instead of to any application.
     OverviewKey { keycode: u8, modifiers: Modifiers },
-    /// A window thumbnail captured for the overview, as plain RGBA bytes so
-    /// nothing non-`Send` crosses the channel from the capture callback. Only
-    /// ever produced by the `thumbnails` feature's capture module.
-    #[cfg_attr(not(feature = "thumbnails"), allow(dead_code))]
-    OverviewThumbnail {
-        window_id: WinID,
-        width: u32,
-        height: u32,
-        rgba: Vec<u8>,
-    },
     /// The display's desktop picture, captured for the overview backdrop when
-    /// its file can't be read. Plain RGBA bytes, like `OverviewThumbnail`.
+    /// its file can't be read. Plain RGBA bytes, so nothing non-`Send` crosses
+    /// the channel from the capture callback. Only ever produced by the
+    /// `thumbnails` feature's capture module.
     #[cfg_attr(not(feature = "thumbnails"), allow(dead_code))]
     OverviewWallpaper {
         display_id: CGDirectDisplayID,

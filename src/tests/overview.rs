@@ -1161,19 +1161,19 @@ fn test_overview_refuses_to_open_during_mission_control() {
         ]);
 }
 
-// ── Thumbnails ─────────────────────────────────────────────────────────────
+// ── Wallpaper capture ─────────────────────────────────────────────────────
 
 #[test]
-fn test_overview_thumbnail_for_unknown_window_is_dropped() {
-    let thumbnail = |window_id| Event::OverviewThumbnail {
-        window_id,
+fn test_overview_wallpaper_event_open_and_after_close() {
+    let wallpaper = || Event::OverviewWallpaper {
+        display_id: 1,
         width: 2,
         height: 2,
         rgba: vec![0; 16],
     };
     TestHarness::new()
         .with_windows(2)
-        .on_iteration(2, |world, _state| {
+        .on_iteration(1, |world, _state| {
             let overview = world.get_resource::<Overview>().expect("still open");
             assert_eq!(overview.phase, OverviewPhase::Open);
             assert_eq!(overview.layout.rows[0].tiles.len(), 2);
@@ -1184,11 +1184,5 @@ fn test_overview_thumbnail_for_unknown_window_is_dropped() {
                 "arrives after close"
             );
         })
-        .run(vec![
-            toggle(),
-            thumbnail(4242),
-            thumbnail(0),
-            toggle(),
-            thumbnail(0),
-        ]);
+        .run(vec![toggle(), wallpaper(), toggle(), wallpaper()]);
 }
