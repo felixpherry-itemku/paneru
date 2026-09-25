@@ -39,27 +39,17 @@ pub struct OverviewScene {
     pub progress: f32,
     pub scrim_opacity: f32,
     pub scrim_color: [f64; 3],
-    /// Height of each band's label strip, in points.
-    pub label_height: i32,
     /// Whether to capture window thumbnails (`[overview] thumbnails`).
     pub thumbnails: bool,
-    pub rows: Vec<SceneRow>,
     pub tiles: Vec<SceneTile>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct SceneRow {
-    /// Absolute CG coordinates.
-    pub band: IRect,
-    pub label: String,
-    pub is_active: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SceneTile {
     pub window_id: WinID,
     pub pid: Pid,
-    /// Absolute CG coordinates, already interpolated for `progress`.
+    /// Absolute CG coordinates, already interpolated for `progress` and the
+    /// slide.
     pub frame: IRect,
     pub title: String,
     pub tab_count: usize,
@@ -89,7 +79,6 @@ fn srgb(rgb: [f64; 3], alpha: f64) -> Retained<NSColor> {
 }
 
 const WHITE: [f64; 3] = [1.0, 1.0, 1.0];
-const BAND_RADIUS: CGFloat = 12.0;
 
 /// Draws `text` inside `rect` on one line, truncating the tail, either centred
 /// or left-aligned. Same attributed-string idiom as `FlashMessageView`.
@@ -120,47 +109,6 @@ fn draw_text(text: &str, rect: NSRect, font: &NSFont, color: &NSColor, centered:
         ];
         let _: () = msg_send![&string, drawInRect: rect];
     }
-}
-
-/// A row band: rounded outline plus its label in the strip above the tiles.
-fn draw_row(row: &SceneRow, origin: IVec2, label_height: i32, progress: f64) {
-    let band = local_rect(row.band, origin);
-    let (alpha, width) = if row.is_active {
-        (0.35, 2.0)
-    } else {
-        (0.12, 1.0)
-    };
-    let path =
-        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(band, BAND_RADIUS, BAND_RADIUS);
-    path.setLineWidth(width);
-    srgb(WHITE, alpha * progress).setStroke();
-    path.stroke();
-
-    if label_height <= 0 {
-        return;
-    }
-    let height = f64::from(label_height);
-    let font_size = (height * 0.7).max(1.0);
-    let font = if row.is_active {
-        NSFont::boldSystemFontOfSize(font_size)
-    } else {
-        NSFont::systemFontOfSize(font_size)
-    };
-    let text_alpha = if row.is_active { 0.95 } else { 0.6 };
-    let label = NSRect::new(
-        NSPoint::new(
-            band.origin.x + BAND_RADIUS,
-            band.origin.y + (height - font_size) / 4.0,
-        ),
-        NSSize::new((band.size.width - 2.0 * BAND_RADIUS).max(1.0), height),
-    );
-    draw_text(
-        &row.label,
-        label,
-        &font,
-        &srgb(WHITE, text_alpha * progress),
-        false,
-    );
 }
 
 const TILE_FILL: [f64; 3] = [0.16, 0.16, 0.18];
@@ -322,9 +270,6 @@ define_class!(
             NSBezierPath::fillRect(bounds);
 
             let origin = scene.display.min;
-            for row in &scene.rows {
-                draw_row(row, origin, scene.label_height, progress);
-            }
             for tile in &scene.tiles {
                 let icon = state.icons.get(&tile.pid).map(|icon| &**icon);
                 let thumbnail = state.thumbnails.get(&tile.window_id).map(|image| &**image);

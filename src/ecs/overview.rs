@@ -1,6 +1,9 @@
-//! The overview: a zoomed-out map of every virtual workspace row on the active
-//! display. The selection is the real focus: moves run as ordinary focus
-//! commands on the live layout behind it, and it re-projects to follow.
+//! The overview: the active display's virtual workspace rows, zoomed out niri
+//! style. The focused window sits in the middle of the screen, and the other
+//! rows stack above and below it, possibly off screen, each centred on the
+//! window ↑/↓ would land on. The selection is the real focus: moves run as
+//! ordinary focus commands on the live layout behind it, and it re-projects
+//! and slides to follow.
 //!
 //! The `Overview` resource exists exactly while the overview is on screen, and
 //! every system here is gated on it so nothing is scheduled while it is shut.
@@ -35,7 +38,7 @@ use crate::ecs::{
 };
 use crate::events::Event;
 use crate::manager::{Display, Window};
-use crate::overlay::{OverviewRenderer, OverviewScene, SceneRow, SceneTile};
+use crate::overlay::{OverviewRenderer, OverviewScene, SceneTile};
 use crate::platform::Modifiers;
 use crate::platform::input::set_overview_active;
 
@@ -632,16 +635,6 @@ fn overview_render(
     let mut bounds = display.bounds();
     bounds.min.y -= display.menubar_height();
 
-    let rows = overview
-        .layout
-        .rows
-        .iter()
-        .map(|row| SceneRow {
-            band: row.band,
-            label: (row.virtual_index + 1).to_string(),
-            is_active: row.is_active,
-        })
-        .collect();
     let tiles = overview
         .layout
         .rows
@@ -654,7 +647,7 @@ fn overview_render(
                 pid: window
                     .and_then(|window| window.pid().ok())
                     .unwrap_or_default(),
-                frame: tile.frame_at(overview.progress),
+                frame: tile.drawn(overview.progress, overview.slide),
                 title: window
                     .and_then(|window| window.title().ok())
                     .unwrap_or_default(),
@@ -671,9 +664,7 @@ fn overview_render(
         progress: overview.progress,
         scrim_opacity: config.overview_scrim_opacity(),
         scrim_color: config.overview_scrim_color(),
-        label_height: 20,
         thumbnails: config.overview_thumbnails(),
-        rows,
         tiles,
     });
 }
