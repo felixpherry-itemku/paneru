@@ -12,8 +12,8 @@ use crate::assert_focused;
 use crate::commands::{Command, Direction, MoveFocus, Operation};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::overview::{
-    KeyAction, Overview, OverviewConfig, OverviewLayout, OverviewPhase, OverviewTile, key_action,
-    project, step_progress,
+    KeyAction, Overview, OverviewConfig, OverviewLayout, OverviewPhase, OverviewRow, OverviewTile,
+    key_action, project, step_progress, tile_at,
 };
 use crate::ecs::params::FrameActivity;
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SpawnWindowTrigger};
@@ -485,11 +485,57 @@ fn test_overview_tile_frame_at_endpoints() {
         entity: entities(1)[0],
         target: IRect::new(10, 20, 110, 70),
         origin: IRect::new(-500, 900, 300, 1500),
+        from: None,
         tab_count: 1,
     };
     assert_eq!(tile.frame_at(0.0), tile.origin);
     assert_eq!(tile.frame_at(1.0), tile.target);
     assert_eq!(tile.frame_at(0.5), IRect::new(-245, 460, 205, 785));
+    for (progress, slide) in [(0.0, 0.0), (0.5, 0.3), (1.0, 1.0)] {
+        assert_eq!(
+            tile.drawn(progress, slide),
+            tile.frame_at(progress),
+            "no slide without a `from`"
+        );
+    }
+
+    let from = IRect::new(210, 20, 310, 70);
+    let sliding = OverviewTile {
+        from: Some(from),
+        ..tile
+    };
+    assert_eq!(sliding.drawn(1.0, 0.0), from);
+    assert_eq!(sliding.drawn(1.0, 1.0), sliding.target);
+    assert_eq!(sliding.drawn(1.0, 0.5), IRect::new(110, 20, 210, 70));
+}
+
+#[test]
+fn test_overview_tile_at_hits_the_drawn_frame() {
+    let from = IRect::new(0, 0, 100, 100);
+    let target = IRect::new(200, 0, 300, 100);
+    let tile = OverviewTile {
+        entity: entities(1)[0],
+        target,
+        origin: target,
+        from: Some(from),
+        tab_count: 1,
+    };
+    let layout = OverviewLayout {
+        rows: vec![OverviewRow {
+            strip: entities(2)[1],
+            virtual_index: 0,
+            is_active: true,
+            band: target,
+            tiles: vec![tile.clone()],
+        }],
+    };
+    let in_from = from.center();
+    let in_target = target.center();
+
+    assert_eq!(tile_at(&layout, 1.0, 0.0, in_from), Some(tile.entity));
+    assert_eq!(tile_at(&layout, 1.0, 0.0, in_target), None);
+    assert_eq!(tile_at(&layout, 1.0, 1.0, in_from), None);
+    assert_eq!(tile_at(&layout, 1.0, 1.0, in_target), Some(tile.entity));
 }
 
 #[test]
@@ -541,12 +587,13 @@ fn test_overview_progress_lands_exactly_on_its_goal() {
 
 #[test]
 fn test_overview_mid_frame_only_while_animating() {
-    let mid_frame = |phase: Option<OverviewPhase>| {
+    let mid_frame = |phase: Option<OverviewPhase>, slide: f32| {
         let mut world = World::new();
         if let Some(phase) = phase {
             world.insert_resource(Overview {
                 phase,
                 progress: 0.5,
+                slide,
                 selected: None,
                 hovered: None,
                 layout: OverviewLayout::default(),
@@ -562,12 +609,19 @@ fn test_overview_mid_frame_only_while_animating() {
             .mid_frame()
     };
 
-    assert!(!mid_frame(None));
-    assert!(mid_frame(Some(OverviewPhase::Opening)));
-    assert!(mid_frame(Some(OverviewPhase::Closing { activate: None })));
+    assert!(!mid_frame(None, 1.0));
+    assert!(mid_frame(Some(OverviewPhase::Opening), 1.0));
+    assert!(mid_frame(
+        Some(OverviewPhase::Closing { activate: None }),
+        1.0
+    ));
     assert!(
-        !mid_frame(Some(OverviewPhase::Open)),
+        !mid_frame(Some(OverviewPhase::Open), 1.0),
         "a settled overview idles"
+    );
+    assert!(
+        mid_frame(Some(OverviewPhase::Open), 0.5),
+        "sliding tiles keep drawing"
     );
 }
 

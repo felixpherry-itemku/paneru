@@ -98,6 +98,8 @@ pub struct Overview {
     pub phase: OverviewPhase,
     /// 0.0 = windows at their real on-screen frames, 1.0 = fully zoomed out.
     pub progress: f32,
+    /// 0.0 = tiles at their `from` frames, 1.0 = settled at their zoom frames.
+    pub slide: f32,
     /// The focused window's tile, derived by `overview_project`.
     pub selected: Option<Entity>,
     /// The tile under the mouse pointer, highlighted but not selected.
@@ -117,6 +119,7 @@ impl Overview {
         Self {
             phase: OverviewPhase::Opening,
             progress: 0.0,
+            slide: 1.0,
             selected: None,
             hovered: None,
             layout: OverviewLayout::default(),
@@ -157,15 +160,16 @@ impl OverviewLayout {
     }
 }
 
-/// The tile under `point` (absolute CG coordinates) as drawn at `progress`.
-/// Tiles are drawn in order, so the last one containing the point is on top.
-pub fn tile_at(layout: &OverviewLayout, progress: f32, point: IVec2) -> Option<Entity> {
+/// The tile under `point` (absolute CG coordinates) as drawn at `progress` and
+/// `slide`. Tiles are drawn in order, so the last one containing the point is
+/// on top.
+pub fn tile_at(layout: &OverviewLayout, progress: f32, slide: f32, point: IVec2) -> Option<Entity> {
     layout
         .rows
         .iter()
         .flat_map(|row| &row.tiles)
         .rev()
-        .find(|tile| tile.frame_at(progress).contains(point))
+        .find(|tile| tile.drawn(progress, slide).contains(point))
         .map(|tile| tile.entity)
 }
 
@@ -194,6 +198,9 @@ pub struct OverviewTile {
     pub target: IRect,
     /// The window's real current frame, the animation's start point.
     pub origin: IRect,
+    /// Where the tile was drawn when the current slide began; `None` for a
+    /// tile that appeared in place.
+    pub from: Option<IRect>,
     /// Greater than 1 when the tile stands for a native tab group.
     pub tab_count: usize,
 }
@@ -202,18 +209,30 @@ impl OverviewTile {
     /// The tile's frame at `progress`, interpolating linearly from `origin`
     /// (0.0) to `target` (1.0).
     pub fn frame_at(&self, progress: f32) -> IRect {
-        let t = f64::from(progress.clamp(0.0, 1.0));
-        #[allow(clippy::cast_possible_truncation)]
-        let lerp = |from: i32, to: i32| {
-            (f64::from(from) + (f64::from(to) - f64::from(from)) * t).round() as i32
-        };
-        IRect::new(
-            lerp(self.origin.min.x, self.target.min.x),
-            lerp(self.origin.min.y, self.target.min.y),
-            lerp(self.origin.max.x, self.target.max.x),
-            lerp(self.origin.max.y, self.target.max.y),
-        )
+        lerp_rect(self.origin, self.target, progress)
     }
+
+    /// Where the tile is drawn: sliding from `from` towards its zoom frame.
+    pub fn drawn(&self, progress: f32, slide: f32) -> IRect {
+        let frame = self.frame_at(progress);
+        self.from
+            .map_or(frame, |from| lerp_rect(from, frame, slide))
+    }
+}
+
+/// `from` (0.0) to `to` (1.0), rounded to whole points.
+fn lerp_rect(from: IRect, to: IRect, t: f32) -> IRect {
+    let t = f64::from(t.clamp(0.0, 1.0));
+    #[allow(clippy::cast_possible_truncation)]
+    let lerp = |from: i32, to: i32| {
+        (f64::from(from) + (f64::from(to) - f64::from(from)) * t).round() as i32
+    };
+    IRect::new(
+        lerp(from.min.x, to.min.x),
+        lerp(from.min.y, to.min.y),
+        lerp(from.max.x, to.max.x),
+        lerp(from.max.y, to.max.y),
+    )
 }
 
 /// The slice of [`Config`] the projection needs, so [`project`] stays free of
@@ -321,6 +340,7 @@ where
                         entity,
                         target,
                         origin,
+                        from: None,
                         tab_count: 1,
                     };
                     tiles.push((rect, tile));
@@ -452,11 +472,21 @@ fn overview_input(
             // A click activates the tile under it; a click anywhere else
             // closes, like clicking outside a menu.
             Event::MouseDown { point, .. } => {
-                let hit = tile_at(&overview.layout, overview.progress, cg_point(*point));
+                let hit = tile_at(
+                    &overview.layout,
+                    overview.progress,
+                    overview.slide,
+                    cg_point(*point),
+                );
                 overview.close(hit);
             }
             Event::MouseMoved { point, .. } => {
-                let hit = tile_at(&overview.layout, overview.progress, cg_point(*point));
+                let hit = tile_at(
+                    &overview.layout,
+                    overview.progress,
+                    overview.slide,
+                    cg_point(*point),
+                );
                 // Compared first: every pointer move would otherwise mark the
                 // overview changed and redraw it.
                 if overview.hovered != hit {
@@ -548,12 +578,29 @@ fn overview_project(
         .iter()
         .filter_map(|&(entity, _, _, centre)| Some((entity, centre?)))
         .collect();
-    let layout = project(
+    let mut layout = project(
         &rows,
         active_display.actual_bounds(&config),
         OverviewConfig::from(config.as_ref()),
         &|entity| windows.moving_frame(entity),
     );
+
+    // FLIP: every tile already on screen slides from where it's drawn now. A
+    // new tile appears in place, and so does everything on the first projection.
+    if !overview.is_added() {
+        let mut moved = false;
+        for tile in layout.rows.iter_mut().flat_map(|row| &mut row.tiles) {
+            if let Some((_, old)) = overview.layout.find(tile.entity) {
+                let drawn = old.drawn(overview.progress, overview.slide);
+                moved |= drawn != tile.frame_at(overview.progress);
+                tile.from = Some(drawn);
+            }
+        }
+        if moved {
+            overview.slide = 0.0;
+        }
+    }
+
     overview.selected = focused.filter(|entity| layout.find(*entity).is_some());
     if overview
         .hovered
@@ -631,8 +678,9 @@ fn overview_render(
     });
 }
 
-/// Drives `progress` towards 1.0 while opening and 0.0 while closing. A
-/// settled, open overview is left untouched so nothing downstream sees a change.
+/// Drives `progress` towards 1.0 while opening and 0.0 while closing, and
+/// `slide` towards 1.0, both at the same rate. A settled, open overview is
+/// left untouched so nothing downstream sees a change.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn overview_animate(
     mut overview: ResMut<Overview>,
@@ -641,12 +689,19 @@ fn overview_animate(
     renderer: Option<NonSendMut<OverviewRenderer>>,
     mut commands: Commands,
 ) {
+    if overview.phase == OverviewPhase::Open && overview.slide >= 1.0 {
+        return;
+    }
+    let t = ease_out_factor(config.overview_animation_speed(), time.delta_secs_f64());
+    if overview.slide < 1.0 {
+        overview.slide = step_progress(overview.slide, 1.0, t);
+    }
+
     let goal = match overview.phase {
         OverviewPhase::Open => return,
         OverviewPhase::Opening => 1.0,
         OverviewPhase::Closing { .. } => 0.0,
     };
-    let t = ease_out_factor(config.overview_animation_speed(), time.delta_secs_f64());
     overview.progress = step_progress(overview.progress, goal, t);
 
     match overview.phase {

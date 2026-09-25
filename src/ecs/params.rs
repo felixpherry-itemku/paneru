@@ -212,17 +212,17 @@ pub struct FrameActivity<'w, 's> {
 
 impl FrameActivity<'_, '_> {
     /// Returns `true` while any window is being moved, resized or scrolled, a
-    /// flash message is on screen, or the overview is zooming in or out — i.e.
-    /// while frames still need drawing. A settled overview is static.
+    /// flash message is on screen, or the overview is zooming or its tiles are
+    /// sliding — i.e. while frames still need drawing. A settled overview is
+    /// static.
     pub fn mid_frame(&self) -> bool {
         !self.repositioning.is_empty()
             || !self.resizing.is_empty()
             || !self.scrolling.is_empty()
             || !self.flash_messages.is_empty()
-            || self
-                .overview
-                .as_ref()
-                .is_some_and(|overview| overview.phase != OverviewPhase::Open)
+            || self.overview.as_ref().is_some_and(|overview| {
+                overview.phase != OverviewPhase::Open || overview.slide < 1.0
+            })
     }
 }
 
