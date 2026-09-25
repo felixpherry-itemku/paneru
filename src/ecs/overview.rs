@@ -103,9 +103,7 @@ pub struct Overview {
     pub progress: f32,
     /// 0.0 = tiles at their `from` frames, 1.0 = settled at their zoom frames.
     pub slide: f32,
-    /// The focused window's tile, derived by `overview_project`.
-    pub selected: Option<Entity>,
-    /// The tile under the mouse pointer, highlighted but not selected.
+    /// The tile under the mouse pointer, highlighted.
     pub hovered: Option<Entity>,
     pub layout: OverviewLayout,
     /// The display the overview opened on. It closes if another becomes active.
@@ -123,7 +121,6 @@ impl Overview {
             phase: OverviewPhase::Opening,
             progress: 0.0,
             slide: 1.0,
-            selected: None,
             hovered: None,
             layout: OverviewLayout::default(),
             display,
@@ -550,7 +547,7 @@ fn overview_project(
 
     // A focused tab stands for its whole group, whose tile carries the group's
     // first member. Focus on a window with no tile (floating, unmanaged, on
-    // another display) selects nothing.
+    // another display) centres nothing.
     let focused = windows.focused().map(|(_, entity)| {
         rows.iter()
             .find_map(|(_, strip, _, _)| strip.tab_group(entity))
@@ -604,7 +601,6 @@ fn overview_project(
         }
     }
 
-    overview.selected = focused.filter(|entity| layout.find(*entity).is_some());
     if overview
         .hovered
         .is_some_and(|hovered| layout.find(hovered).is_none())
@@ -652,7 +648,6 @@ fn overview_render(
                     .and_then(|window| window.title().ok())
                     .unwrap_or_default(),
                 tab_count: tile.tab_count,
-                selected: overview.selected == Some(tile.entity),
                 hovered: overview.hovered == Some(tile.entity),
             }
         })

@@ -597,7 +597,6 @@ fn test_overview_mid_frame_only_while_animating() {
                 phase,
                 progress: 0.5,
                 slide,
-                selected: None,
                 hovered: None,
                 layout: OverviewLayout::default(),
                 display: 0,
@@ -711,13 +710,6 @@ fn focused_entity(world: &mut World) -> Option<Entity> {
     query.single(world).ok()
 }
 
-fn selected(world: &World) -> Option<Entity> {
-    world
-        .get_resource::<Overview>()
-        .expect("overview open")
-        .selected
-}
-
 /// The tiling area the overview centres its rows in.
 fn viewport(world: &mut World) -> IRect {
     let mut state = SystemState::<(ActiveDisplay, Res<Config>)>::new(world);
@@ -778,7 +770,7 @@ fn test_overview_opens_centred_on_focus() {
 }
 
 #[test]
-fn test_overview_swap_while_open_keeps_the_window_selected() {
+fn test_overview_swap_while_open_keeps_the_window_focused() {
     TestHarness::new()
         .with_windows(3)
         .on_iteration(2, |world, _state| {
@@ -789,7 +781,7 @@ fn test_overview_swap_while_open_keeps_the_window_selected() {
                 "swapped behind the overview"
             );
             assert_focused!(world, 0);
-            assert_eq!(selected(world), Some(w0));
+            assert_eq!(focused_entity(world), Some(w0));
             let overview = world.get_resource::<Overview>().expect("still open");
             let x = |entity| overview.layout.find(entity).expect("tile").1.target.min.x;
             assert!(x(w1) < x(w0), "tiles re-projected in the new order");
@@ -811,7 +803,7 @@ fn test_overview_arrow_moves_real_focus_while_open() {
             assert!(world.get_resource::<Overview>().is_some(), "still open");
             assert_focused!(world, 1);
             let w1 = find_window_entity(1, world);
-            assert_eq!(selected(world), Some(w1));
+            assert_eq!(focused_entity(world), Some(w1));
             assert_centred(world, w1);
         })
         .run(vec![
@@ -867,9 +859,10 @@ fn test_overview_arrow_down_switches_workspace_while_open() {
             assert!(world.get_resource::<Overview>().is_some(), "still open");
             assert_eq!(active_virtual_index(world), 1);
             let row = row_windows(world, 1);
-            let selected = selected(world).expect("a selection");
-            assert!(row.contains(&selected), "selection on the VW1 row");
-            assert_eq!(Some(selected), focused_entity(world));
+            let focused = focused_entity(world).expect("a focus");
+            assert!(row.contains(&focused), "focus on the VW1 row");
+            let overview = world.get_resource::<Overview>().expect("still open");
+            assert!(overview.layout.find(focused).is_some(), "projected");
         })
         .on_iteration(5, |world, _state| {
             assert!(world.get_resource::<Overview>().is_none(), "closed");
@@ -937,7 +930,7 @@ fn test_overview_down_lands_on_the_tile_below_centre() {
             assert!(world.get_resource::<Overview>().is_some(), "still open");
             assert_eq!(active_virtual_index(world), 1);
             let focus = *row_windows(world, 1).last().expect("VW1 windows");
-            assert_eq!(selected(world), Some(focus), "↓ lands straight below");
+            assert_eq!(focused_entity(world), Some(focus), "↓ lands straight below");
             assert_centred(world, focus);
             assert_row_vertically_centred(world, 1);
         })
@@ -973,9 +966,9 @@ fn test_overview_projects_a_window_spawned_while_open() {
         })
         .on_iteration(2, |world, _state| {
             let spawned = find_window_entity(2, world);
+            assert_eq!(focused_entity(world), Some(spawned), "focused");
             let overview = world.get_resource::<Overview>().expect("still open");
             assert!(overview.layout.find(spawned).is_some(), "projected");
-            assert_eq!(overview.selected, Some(spawned), "selected once focused");
         })
         .run(vec![
             Event::MenuOpened { window_id: 0 },
@@ -1061,12 +1054,12 @@ fn test_overview_escape_leaves_focus_and_layout_untouched() {
 }
 
 #[test]
-fn test_overview_closing_the_focused_window_selects_the_new_focus() {
+fn test_overview_closing_the_focused_window_centres_the_new_focus() {
     TestHarness::new()
         .with_windows(3)
         .on_iteration(1, |world, state| {
             let focused = find_window_entity(0, world);
-            assert_eq!(selected(world), Some(focused));
+            assert_eq!(focused_entity(world), Some(focused));
             state.os_close_window(0);
         })
         .on_iteration(2, |world, _state| {
@@ -1079,7 +1072,10 @@ fn test_overview_closing_the_focused_window_selects_the_new_focus() {
                 .map(|row| row.tiles.len())
                 .sum::<usize>();
             assert_eq!(tiles, 2, "the closed window's tile is gone");
-            assert_eq!(overview.selected, focused, "the selection is the focus");
+            assert!(
+                focused.is_some_and(|focused| overview.layout.find(focused).is_some()),
+                "the new focus is projected"
+            );
             assert_centred(world, focused.expect("a new focus"));
         })
         .run(vec![
@@ -1093,8 +1089,8 @@ fn test_overview_closing_the_focused_window_selects_the_new_focus() {
 fn test_overview_with_no_windows_opens_and_closes() {
     TestHarness::new()
         .on_iteration(0, |world, _state| {
+            assert!(focused_entity(world).is_none());
             let overview = world.get_resource::<Overview>().expect("overview open");
-            assert_eq!(overview.selected, None);
             assert!(overview.layout.rows.iter().all(|row| row.tiles.is_empty()));
         })
         .on_iteration(1, |world, _state| {

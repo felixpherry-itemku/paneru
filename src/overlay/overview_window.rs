@@ -53,7 +53,6 @@ pub struct SceneTile {
     pub frame: IRect,
     pub title: String,
     pub tab_count: usize,
-    pub selected: bool,
     pub hovered: bool,
 }
 
@@ -112,7 +111,6 @@ fn draw_text(text: &str, rect: NSRect, font: &NSFont, color: &NSColor, centered:
 }
 
 const TILE_FILL: [f64; 3] = [0.16, 0.16, 0.18];
-const SELECTED: [f64; 3] = [0.30, 0.60, 1.0];
 const TILE_RADIUS: CGFloat = 10.0;
 const TITLE_FONT_SIZE: CGFloat = 12.0;
 
@@ -166,15 +164,13 @@ fn draw_tile(
     let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, radius, radius);
     srgb(TILE_FILL, 0.92 * progress).setFill();
     path.fill();
-    let (border, alpha, width) = if tile.selected {
-        (SELECTED, progress, 3.0)
-    } else if tile.hovered {
-        (WHITE, 0.5 * progress, 2.0)
+    let (alpha, width) = if tile.hovered {
+        (0.5 * progress, 2.0)
     } else {
-        (WHITE, 0.18 * progress, 1.0)
+        (0.18 * progress, 1.0)
     };
     path.setLineWidth(width);
-    srgb(border, alpha).setStroke();
+    srgb(WHITE, alpha).setStroke();
 
     if let Some(thumbnail) = thumbnail
         && let Some(context) = NSGraphicsContext::currentContext()
