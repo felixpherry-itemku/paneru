@@ -222,7 +222,7 @@ impl From<&Config> for OverviewConfig {
     fn from(config: &Config) -> Self {
         Self {
             row_gap: config.overview_row_gap(),
-            label_height: config.overview_label_height(),
+            label_height: 20,
         }
     }
 }
@@ -591,7 +591,7 @@ fn overview_render(
         progress: overview.progress,
         scrim_opacity: config.overview_scrim_opacity(),
         scrim_color: config.overview_scrim_color(),
-        label_height: config.overview_label_height(),
+        label_height: 20,
         thumbnails: config.overview_thumbnails(),
         rows,
         tiles,

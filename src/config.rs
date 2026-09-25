@@ -735,8 +735,14 @@ impl Config {
         self.overview().row_gap.unwrap_or(24).max(0)
     }
 
-    pub fn overview_label_height(&self) -> i32 {
-        self.overview().label_height.unwrap_or(20).max(0)
+    // Unread until overview-niri-centring Phase 2 wires it into `OverviewConfig`.
+    #[allow(dead_code)]
+    pub fn overview_zoom(&self) -> f64 {
+        self.overview()
+            .zoom
+            .filter(|zoom| zoom.is_finite())
+            .unwrap_or(0.5)
+            .clamp(0.1, 0.75)
     }
 
     pub fn overview_thumbnails(&self) -> bool {
@@ -1214,10 +1220,10 @@ pub struct OverviewOptions {
     /// Dim colour as `[r, g, b]` in `0.0..=1.0`; also the solid backdrop when
     /// the display has no still wallpaper.
     pub scrim_color: Option<[f64; 3]>,
-    /// Vertical gap between row bands, in points.
+    /// Vertical gap between workspace rows, in points.
     pub row_gap: Option<i32>,
-    /// Space reserved at the top of each band for its row label, in points.
-    pub label_height: Option<i32>,
+    /// Size of each workspace row relative to the tiling area, `0.1..=0.75`.
+    pub zoom: Option<f64>,
     /// Master switch for window thumbnails (needs Screen Recording).
     pub thumbnails: Option<bool>,
 }
@@ -2451,7 +2457,7 @@ animation_speed = 12.0
     assert!((config.overview_scrim_opacity() - 0.3).abs() < f32::EPSILON);
     assert_eq!(config.overview_scrim_color(), [0.05, 0.05, 0.07]);
     assert_eq!(config.overview_row_gap(), 24);
-    assert_eq!(config.overview_label_height(), 20);
+    assert_eq!(config.overview_zoom(), 0.5);
     assert!(config.overview_thumbnails());
 }
 
@@ -2468,7 +2474,7 @@ animation_speed = 30.0
 scrim_opacity = 1.5
 scrim_color = [0.1, 0.2, 0.3]
 row_gap = 8
-label_height = 0
+zoom = 0.3
 thumbnails = false
 
 [bindings]
@@ -2480,8 +2486,22 @@ thumbnails = false
     assert!((config.overview_scrim_opacity() - 1.0).abs() < f32::EPSILON);
     assert_eq!(config.overview_scrim_color(), [0.1, 0.2, 0.3]);
     assert_eq!(config.overview_row_gap(), 8);
-    assert_eq!(config.overview_label_height(), 0);
+    assert_eq!(config.overview_zoom(), 0.3);
     assert!(!config.overview_thumbnails());
+}
+
+#[test]
+#[allow(clippy::float_cmp)]
+fn test_overview_zoom_is_clamped() {
+    let zoom = |overview: &str| {
+        Config::try_from(format!("[options]\n\n[overview]\n{overview}\n\n[bindings]\n").as_str())
+            .expect("config should parse")
+            .overview_zoom()
+    };
+
+    assert_eq!(zoom("zoom = 0.01"), 0.1);
+    assert_eq!(zoom("zoom = 2.0"), 0.75);
+    assert_eq!(zoom(""), 0.5);
 }
 
 #[test]
