@@ -927,25 +927,19 @@ pub(super) fn window_managed_trigger(
     ctx.commands.reshuffle_around(entity);
 }
 
-/// Handles the event when a window is destroyed. The windows itself is not removed from the layout
-/// strip. This happens in the On<Remove, Window> trigger.
+/// Handles the event when a window is destroyed by despawning it. Removing it from the layout
+/// strip and handing its focus on happen in the On<Remove, Window> trigger.
 ///
 /// # Arguments
 ///
 /// * `messages` - The event stream carrying the ID of the destroyed window.
-/// * `active_display` - The active display and its layout strip.
 /// * `apps` - A query for all applications.
-/// * `global_state` - Focus-follows-mouse and reshuffle flags.
-/// * `focus_history` - Per-workspace record of what was focused last.
 /// * `windows` - A query for all windows with their parent.
-/// * `commands` - Bevy commands to despawn entities and trigger events.
+/// * `commands` - Bevy commands to despawn entities.
 #[instrument(level = Level::DEBUG, skip_all)]
 pub(super) fn window_destroyed_trigger(
     mut messages: MessageReader<Event>,
-    active_display: ActiveDisplay,
     mut apps: Query<&mut Application>,
-    mut global_state: GlobalState,
-    mut focus_history: ResMut<FocusHistory>,
     windows: Windows,
     mut commands: Commands,
 ) {
@@ -982,16 +976,6 @@ pub(super) fn window_destroyed_trigger(
 
         app.unobserve_window(window);
 
-        give_away_focus(
-            entity,
-            &windows,
-            active_display.active_strip(),
-            &active_display.bounds(),
-            &mut global_state,
-            &mut commands,
-        );
-        focus_history.forget(entity);
-
         if let Ok(mut entity_commands) = commands.get_entity(entity) {
             entity_commands.try_despawn();
         }
@@ -1015,7 +999,8 @@ pub(super) fn invalidate_window_title(mut messages: MessageReader<Event>, window
     }
 }
 
-/// Moves the focus away to a neighbour window.
+/// Moves the focus away to a neighbour window when one is minimized or hidden.
+/// Closing windows hand focus on in `window_removal_trigger` instead.
 fn give_away_focus(
     entity: Entity,
     windows: &Windows,
@@ -1417,19 +1402,85 @@ pub(super) fn refresh_configuration_trigger(
     }
 }
 
+/// Every despawn path (a destroy event, the unordered-window cleanup, an app
+/// quitting and taking its windows with it) ends here while the strip still
+/// holds the window, so this is where a closing window hands its focus on.
+///
+/// niri: the next window down its stack, else up; otherwise the column it was
+/// opened or tiled back beside, else the column that slides into its index,
+/// else its left neighbour. A floating window hands focus to the active column.
+/// Only a window that had focus hands it on, or one that lost it within the
+/// close grace because its app focused its own next window first.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn window_removal_trigger(
     trigger: On<Remove, Window>,
-    mut workspaces: Query<&mut LayoutStrip>,
+    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    windows: Windows,
+    mut focus_history: ResMut<FocusHistory>,
+    time: Res<Time>,
+    mut global_state: GlobalState,
+    mut commands: Commands,
 ) {
     let entity = trigger.event().entity;
+    let focused = windows.focused().map(|(_, focused)| focused);
+    let had_focus = focused == Some(entity);
 
-    if let Some(mut strip) = workspaces.iter_mut().find(|strip| strip.contains(entity)) {
+    let mut next = None;
+    if let Some((mut strip, _)) = workspaces
+        .iter_mut()
+        .find(|(strip, _)| strip.contains(entity))
+    {
         debug!(
             "Removing despawned entity {entity} from strip {}",
             strip.id()
         );
+        let tabbed = strip.tabbed(entity);
+        let index = strip.index_of(entity).ok();
+        let successor = strip.successor(entity);
+        let same_column = successor.is_some_and(|next| strip.index_of(next).ok() == index);
+        let was_active = focus_history.last_managed(strip.id()) == Some(entity);
         strip.remove(entity);
+
+        // A native tab leaves picking the next tab to the app.
+        if !tabbed
+            && let Some(active) = focus_history.hand_off(
+                strip.id(),
+                entity,
+                Some(time.elapsed()),
+                |column| !same_column && strip.contains(column),
+                successor,
+            )
+            // Not active yet still handed on: it lost focus within the grace.
+            // Nothing focused: an earlier close this frame queued its focus
+            // hand-off, which hasn't landed yet.
+            && (had_focus || !was_active || focused.is_none())
+        {
+            next = Some(active);
+        }
+    } else if had_focus && let Some((_, _, Some(Unmanaged::Floating))) = windows.get_managed(entity)
+    {
+        next = workspaces
+            .iter()
+            .find_map(|(strip, active)| {
+                active.then(|| {
+                    focus_history
+                        .last_managed(strip.id())
+                        .filter(|column| strip.contains(*column))
+                })
+            })
+            .flatten();
     }
+
+    if let Some(next) = next {
+        global_state.set_ffm_flag(None);
+        // Use focus_entity instead of triggering Event::WindowFocused: the
+        // OS has usually handed focus to a different app after the current
+        // window closed/hid, so window_focused_trigger's frontmost/focused
+        // guards would reject a fabricated event. focus_entity calls the
+        // AX API to raise the neighbour and inserts FocusedMarker directly.
+        commands.focus_entity(next, true);
+    }
+    focus_history.forget(entity);
 }
 
 pub(super) fn send_message_trigger(
