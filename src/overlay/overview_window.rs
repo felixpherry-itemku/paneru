@@ -323,6 +323,9 @@ pub struct OverviewRenderer {
     /// The display whose captured picture this open shows, so a capture
     /// arriving for it replaces the backdrop.
     awaiting: Option<CGDirectDisplayID>,
+    /// THROWAWAY Phase 1 probe (removed in Phase 3): live streams per window.
+    #[cfg(feature = "thumbnails")]
+    probe: HashMap<WinID, crate::manager::capture::LiveStream>,
 }
 
 impl OverviewRenderer {
@@ -336,6 +339,8 @@ impl OverviewRenderer {
             wallpaper: None,
             captured: HashMap::new(),
             awaiting: None,
+            #[cfg(feature = "thumbnails")]
+            probe: HashMap::new(),
         }
     }
 
@@ -359,6 +364,8 @@ impl OverviewRenderer {
 
     /// Shows `scene`, creating the window on first use. A no-op when the scene
     /// matches the last one drawn.
+    // THROWAWAY Phase 1 probe pushes this over the limit; gone in Phase 3.
+    #[allow(clippy::too_many_lines)]
     pub fn render(&mut self, scene: OverviewScene) {
         if self.scene.as_ref() == Some(&scene) {
             return;
@@ -445,6 +452,55 @@ impl OverviewRenderer {
             #[cfg(not(feature = "thumbnails"))]
             drop(requests);
         }
+
+        // THROWAWAY Phase 1 probe (removed in Phase 3): once settled, stream
+        // each tile into a plain sublayer, to see whether covered windows keep
+        // updating.
+        #[cfg(feature = "thumbnails")]
+        if scene.thumbnails && scene.progress >= 1.0 {
+            use crate::manager::capture::{FrameSink, start_streams};
+            use dispatch2::MainThreadBound;
+            use objc2_io_surface::IOSurfaceRef;
+            use objc2_quartz_core::{CALayer, CATransaction};
+            use std::sync::Arc;
+
+            view.setWantsLayer(true);
+            if let Some(host) = view.layer() {
+                let height = view.bounds().size.height;
+                let flipped = host.isGeometryFlipped();
+                let mut requests = Vec::new();
+                for tile in &scene.tiles {
+                    if tile.window_id == 0 || self.probe.contains_key(&tile.window_id) {
+                        continue;
+                    }
+                    let mut rect = local_rect(tile.frame, scene.display.min);
+                    if !flipped {
+                        rect.origin.y = height - rect.origin.y - rect.size.height;
+                    }
+                    let layer = CALayer::new();
+                    layer.setFrame(rect);
+                    host.addSublayer(&layer);
+                    let sink: FrameSink = Arc::new(MainThreadBound::new(
+                        Box::new(move |surface: &IOSurfaceRef| {
+                            CATransaction::begin();
+                            CATransaction::setDisableActions(true);
+                            let contents = std::ptr::from_ref(surface).cast::<AnyObject>();
+                            unsafe { layer.setContents(Some(&*contents)) };
+                            CATransaction::commit();
+                        }),
+                        self.mtm,
+                    ));
+                    requests.push((
+                        tile.window_id,
+                        pixels(tile.frame.width()),
+                        pixels(tile.frame.height()),
+                        sink,
+                    ));
+                }
+                tracing::debug!(flipped, count = requests.len(), "overview probe streams");
+                self.probe.extend(start_streams(requests));
+            }
+        }
         self.scene = Some(scene);
     }
 
@@ -486,6 +542,8 @@ impl OverviewRenderer {
 
     /// Takes the window down and forgets everything drawn in it.
     pub fn close(&mut self) {
+        #[cfg(feature = "thumbnails")]
+        self.probe.clear();
         set_overview_window(0);
         if let Some((window, view)) = self.window.take() {
             window.orderOut(None::<&AnyObject>);

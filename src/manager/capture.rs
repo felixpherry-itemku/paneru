@@ -7,16 +7,23 @@
 //! backdrop. Nothing ever errors.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use bevy::math::IRect;
 use block2::RcBlock;
-use objc2::AnyThread;
+use dispatch2::{DispatchQueue, DispatchRetained, MainThreadBound};
 use objc2::rc::Retained;
-use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
+use objc2::{AnyThread, DefinedClass, MainThreadMarker, define_class, msg_send};
+use objc2_core_foundation::{CFRetained, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{CGContext, CGDirectDisplayID, CGImage};
+use objc2_core_media::{CMSampleBuffer, CMTime, CMTimeFlags};
+use objc2_core_video::CVPixelBufferGetIOSurface;
 use objc2_foundation::NSError;
+use objc2_io_surface::IOSurfaceRef;
 use objc2_screen_capture_kit::{
-    SCContentFilter, SCScreenshotManager, SCShareableContent, SCStreamConfiguration, SCWindow,
+    SCContentFilter, SCScreenshotManager, SCShareableContent, SCStream, SCStreamConfiguration,
+    SCStreamOutput, SCStreamOutputType, SCWindow,
 };
 use tracing::debug;
 
@@ -24,6 +31,200 @@ use crate::events::{Event, EventSender};
 use crate::manager::irect_from;
 use crate::platform::WinID;
 use crate::util::rgba_bitmap_context;
+
+/// Called on the main thread with each new frame of one window's stream.
+/// Built on the main thread by the renderer, which owns what it draws into.
+pub type FrameSink = Arc<MainThreadBound<Box<dyn Fn(&IOSurfaceRef)>>>;
+
+/// One window's live stream, running or still starting. Dropping it stops the
+/// stream, or keeps a still-starting one from ever running.
+pub struct LiveStream(Arc<Mutex<Slot>>);
+
+/// What a [`LiveStream`] shares with the completion handler that starts it.
+#[derive(Default)]
+struct Slot {
+    /// Set by the handle's drop, so a completion arriving later starts nothing
+    /// nobody owns.
+    cancelled: bool,
+    stream: Option<Retained<SCStream>>,
+    /// Kept alive as long as the stream runs.
+    output: Option<Retained<StreamOutput>>,
+}
+
+// SAFETY: `SCStream` isn't marked `Send`, but a slot only ever moves one
+// between `ScreenCaptureKit`'s completion queue, which starts it, and the main
+// thread, which stops it; both under the slot's mutex, never used at once.
+unsafe impl Send for Slot {}
+
+impl Drop for LiveStream {
+    fn drop(&mut self) {
+        let mut slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        slot.cancelled = true;
+        if let Some(stream) = slot.stream.take() {
+            unsafe { stream.stopCaptureWithCompletionHandler(None) };
+        }
+        slot.output = None;
+    }
+}
+
+/// An `IOSurface` on its way from `ScreenCaptureKit`'s sample queue to the
+/// main thread.
+struct SendSurface(CFRetained<IOSurfaceRef>);
+
+// SAFETY: an `IOSurface` is a kernel object, safe to retain, release and use
+// from any thread; this only moves one reference across a queue hop.
+unsafe impl Send for SendSurface {}
+
+define_class!(
+    // SAFETY:
+    // - The superclass NSObject does not have any subclassing requirements.
+    // - `StreamOutput` does not implement `Drop`.
+    #[unsafe(super(NSObject))]
+    #[name = "PaneruStreamOutput"]
+    #[ivars = FrameSink]
+    struct StreamOutput;
+
+    unsafe impl NSObjectProtocol for StreamOutput {}
+
+    unsafe impl SCStreamOutput for StreamOutput {
+        /// Runs on [`stream_queue`] for every sample. Hands the frame's surface
+        /// to the main queue and nothing else: no event, no waker, so a
+        /// settled overview never ticks Bevy.
+        #[unsafe(method(stream:didOutputSampleBuffer:ofType:))]
+        fn stream_did_output(
+            &self,
+            _stream: &SCStream,
+            sample_buffer: &CMSampleBuffer,
+            kind: SCStreamOutputType,
+        ) {
+            if kind != SCStreamOutputType::Screen {
+                return;
+            }
+            // Idle and blank samples carry no image: keep showing the last one.
+            let Some(surface) = (unsafe { sample_buffer.image_buffer() })
+                .and_then(|buffer| CVPixelBufferGetIOSurface(Some(&buffer)))
+            else {
+                return;
+            };
+            let surface = SendSurface(surface);
+            let sink = self.ivars().clone();
+            DispatchQueue::main().exec_async(move || {
+                // Whole, so the closure captures the `Send` wrapper and not
+                // its field.
+                let surface = surface;
+                if let Some(mtm) = MainThreadMarker::new() {
+                    (sink.get(mtm))(&surface.0);
+                }
+            });
+        }
+    }
+);
+
+impl StreamOutput {
+    fn new(sink: FrameSink) -> Retained<Self> {
+        let this = Self::alloc().set_ivars(sink);
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// The one serial queue every stream delivers its samples on.
+fn stream_queue() -> &'static DispatchQueue {
+    static QUEUE: OnceLock<DispatchRetained<DispatchQueue>> = OnceLock::new();
+    QUEUE.get_or_init(|| DispatchQueue::new("paneru.overview.streams", None))
+}
+
+/// Starts a live stream per `(window, pixel width, pixel height, sink)`, at
+/// most 30 frames per second. Returns the handles at once; the streams come up
+/// asynchronously, and a window `ScreenCaptureKit` can't see (or a denied
+/// permission) just never delivers a frame.
+pub fn start_streams(requests: Vec<(WinID, u32, u32, FrameSink)>) -> Vec<(WinID, LiveStream)> {
+    if requests.is_empty() || !objc2::available!(macos = 14.0) {
+        return Vec::new();
+    }
+    let requests = requests
+        .into_iter()
+        .map(|(window_id, width, height, sink)| {
+            let slot = Arc::new(Mutex::new(Slot::default()));
+            (window_id, width, height, sink, slot)
+        })
+        .collect::<Vec<_>>();
+    let live = requests
+        .iter()
+        .map(|(window_id, .., slot)| (*window_id, LiveStream(slot.clone())))
+        .collect();
+
+    let handler = RcBlock::new(
+        move |content: *mut SCShareableContent, error: *mut NSError| {
+            let Some(content) = (unsafe { content.as_ref() }) else {
+                debug!("no shareable content: {:?}", unsafe { error.as_ref() });
+                return;
+            };
+            let by_id = unsafe { content.windows() }
+                .iter()
+                .map(|window| (unsafe { window.windowID() }, window))
+                .collect::<HashMap<u32, Retained<SCWindow>>>();
+            for &(window_id, width, height, ref sink, ref slot) in &requests {
+                let Some(window) = u32::try_from(window_id).ok().and_then(|id| by_id.get(&id))
+                else {
+                    continue;
+                };
+                let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+                if slot.cancelled {
+                    continue;
+                }
+                let filter = unsafe {
+                    SCContentFilter::initWithDesktopIndependentWindow(
+                        SCContentFilter::alloc(),
+                        window,
+                    )
+                };
+                let config = configuration(width, height);
+                unsafe {
+                    config.setMinimumFrameInterval(CMTime {
+                        value: 1,
+                        timescale: 30,
+                        flags: CMTimeFlags::Valid,
+                        epoch: 0,
+                    });
+                }
+                let output = StreamOutput::new(sink.clone());
+                let stream = unsafe {
+                    SCStream::initWithFilter_configuration_delegate(
+                        SCStream::alloc(),
+                        &filter,
+                        &config,
+                        None,
+                    )
+                };
+                if let Err(error) = unsafe {
+                    stream.addStreamOutput_type_sampleHandlerQueue_error(
+                        ProtocolObject::from_ref(&*output),
+                        SCStreamOutputType::Screen,
+                        Some(stream_queue()),
+                    )
+                } {
+                    debug!("stream output for window {window_id}: {error:?}");
+                    continue;
+                }
+                let started = RcBlock::new(move |error: *mut NSError| {
+                    if let Some(error) = unsafe { error.as_ref() } {
+                        debug!("stream start for window {window_id}: {error:?}");
+                    }
+                });
+                unsafe { stream.startCaptureWithCompletionHandler(Some(&started)) };
+                slot.stream = Some(stream);
+                slot.output = Some(output);
+            }
+        },
+    );
+    // See `request_thumbnails` for why on-screen windows are enough.
+    unsafe {
+        SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
+            true, true, &handler,
+        );
+    }
+    live
+}
 
 /// Requests a thumbnail per `(window, pixel width, pixel height)`. Returns
 /// immediately; each result arrives later as an `Event::OverviewThumbnail`.
@@ -149,14 +350,7 @@ fn capture(
     let filter = unsafe {
         SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), window)
     };
-    let config = unsafe { SCStreamConfiguration::new() };
-    unsafe {
-        config.setWidth(width as usize);
-        config.setHeight(height as usize);
-        config.setShowsCursor(false);
-        config.setScalesToFit(true);
-        config.setIgnoreShadowsSingleWindow(true);
-    }
+    let config = configuration(width, height);
     let handler = RcBlock::new(move |image: *mut CGImage, _error: *mut NSError| {
         // Flattened to plain bytes right here, on ScreenCaptureKit's queue:
         // a `CGImage` is not `Send`, bytes are, so nothing else has to be.
@@ -172,6 +366,19 @@ fn capture(
             Some(&handler),
         );
     }
+}
+
+/// One window at `width` x `height` pixels, without cursor or shadow.
+fn configuration(width: u32, height: u32) -> Retained<SCStreamConfiguration> {
+    let config = unsafe { SCStreamConfiguration::new() };
+    unsafe {
+        config.setWidth(width as usize);
+        config.setHeight(height as usize);
+        config.setShowsCursor(false);
+        config.setScalesToFit(true);
+        config.setIgnoreShadowsSingleWindow(true);
+    }
+    config
 }
 
 /// Draws `image` into a fresh RGBA buffer.
