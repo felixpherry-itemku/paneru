@@ -14,8 +14,9 @@ use crate::commands::{Command, Direction, MoveFocus, Operation};
 use crate::config::Config;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::overview::{
-    KeyAction, Overview, OverviewConfig, OverviewLayout, OverviewPhase, OverviewRow, OverviewTile,
-    key_action, project, step_progress, tile_at,
+    KeyAction, OPEN_CLOSE_STIFFNESS, Overview, OverviewConfig, OverviewLayout, OverviewPhase,
+    OverviewRow, OverviewTile, ROW_SWITCH_STIFFNESS, SLIDE_STIFFNESS, key_action, project,
+    spring_step, tile_at,
 };
 use crate::ecs::params::{ActiveDisplay, FrameActivity};
 use crate::ecs::workspace::PreviousStripPosition;
@@ -560,18 +561,25 @@ fn test_overview_open_projects_active_row() {
 
 // ── Animation ──────────────────────────────────────────────────────────────
 
-/// Steps `progress` towards `goal` until it lands, asserting every step moves
-/// the right way. Returns the number of steps taken.
+/// Steps a spring from rest at `from` towards `goal` in 20 ms frames until it
+/// lands, asserting every step approaches the goal without passing it.
+/// Returns the number of steps taken.
 #[allow(clippy::float_cmp, reason = "landing on exactly the goal is the point")]
-fn animate_to(mut progress: f32, goal: f32) -> usize {
+fn settle(from: f32, goal: f32, stiffness: f64) -> usize {
+    let (mut value, mut velocity) = (from, 0.0);
     for step in 1..=1000 {
-        let next = step_progress(progress, goal, 0.2);
+        let (next, next_velocity) = spring_step(value, velocity, goal, stiffness, 0.02);
         assert!(
-            (goal - next).abs() < (goal - progress).abs(),
-            "step {step} did not approach {goal}: {progress} -> {next}"
+            (goal - next).abs() < (goal - value).abs(),
+            "step {step} did not approach {goal}: {value} -> {next}"
         );
-        progress = next;
-        if progress == goal {
+        assert!(
+            (next - from).abs() <= (goal - from).abs(),
+            "step {step} overshot {goal}: {next}"
+        );
+        (value, velocity) = (next, next_velocity);
+        if value == goal {
+            assert_eq!(velocity, 0.0, "lands at rest");
             return step;
         }
     }
@@ -579,13 +587,32 @@ fn animate_to(mut progress: f32, goal: f32) -> usize {
 }
 
 #[test]
-fn test_overview_progress_lands_exactly_on_its_goal() {
-    assert!(animate_to(0.0, 1.0) < 100);
-    assert!(animate_to(1.0, 0.0) < 100);
-    assert!(
-        (step_progress(0.3, 1.0, 1.0) - 1.0).abs() < f32::EPSILON,
-        "t = 1 snaps"
-    );
+fn test_overview_spring_lands_exactly_on_its_goal() {
+    assert!(settle(0.0, 1.0, OPEN_CLOSE_STIFFNESS) < 100);
+    assert!(settle(1.0, 0.0, OPEN_CLOSE_STIFFNESS) < 100);
+}
+
+#[test]
+fn test_overview_spring_starts_from_rest() {
+    // An ease-out at speed 20 would cover a third of the way in the first frame.
+    let (first, _) = spring_step(0.0, 0.0, 1.0, OPEN_CLOSE_STIFFNESS, 0.02);
+    assert!(first > 0.0 && first < 0.2, "first step {first}");
+}
+
+#[test]
+fn test_overview_spring_is_frame_rate_independent() {
+    let (half, velocity) = spring_step(0.0, 0.0, 1.0, OPEN_CLOSE_STIFFNESS, 0.02);
+    let (twice, _) = spring_step(half, velocity, 1.0, OPEN_CLOSE_STIFFNESS, 0.02);
+    let (once, _) = spring_step(0.0, 0.0, 1.0, OPEN_CLOSE_STIFFNESS, 0.04);
+    assert!((once - twice).abs() < 1e-4, "{once} vs {twice}");
+}
+
+#[test]
+fn test_overview_spring_matches_niri_timing() {
+    // niri's stiffness-800 spring settles in about 0.33 s.
+    let open = settle(0.0, 1.0, OPEN_CLOSE_STIFFNESS);
+    assert!((16..=18).contains(&open), "settled in {open} steps");
+    assert!(settle(0.0, 1.0, ROW_SWITCH_STIFFNESS) < open);
 }
 
 #[test]
@@ -597,6 +624,9 @@ fn test_overview_mid_frame_only_while_animating() {
                 phase,
                 progress: 0.5,
                 slide,
+                progress_velocity: 0.0,
+                slide_velocity: 0.0,
+                slide_stiffness: SLIDE_STIFFNESS,
                 hovered: None,
                 layout: OverviewLayout::default(),
                 display: 0,
@@ -665,6 +695,7 @@ fn test_overview_key_action_maps_bare_keys_only() {
 const KEY_RETURN: u8 = 36;
 const KEY_DOWN: u8 = 125;
 const KEY_RIGHT: u8 = 124;
+const KEY_LEFT: u8 = 123;
 
 fn key(keycode: u8) -> Event {
     Event::OverviewKey {
@@ -815,13 +846,21 @@ fn test_overview_arrow_moves_real_focus_while_open() {
 
 /// Windows 0 and 1 go to VW1, leaving window 2 alone and focused on VW0. Down
 /// from a lone column switches the workspace behind the open overview.
+/// Springs on: `options.animation_speed` set, whatever its value.
+fn springs() -> Config {
+    Config::try_from("[options]\nanimation_speed = 20.0\n[bindings]\n").expect("config parses")
+}
+
+/// Writes `event` straight into the world, so a test can look mid-animation
+/// instead of waiting out `run`'s whole command window.
+fn send(harness: &mut TestHarness, event: Event) {
+    harness.app.world_mut().write_message::<Event>(event);
+}
+
 #[test]
 fn test_overview_focus_move_slides() {
-    // At speed 1.0 the ease lands within `PROGRESS_EPSILON` after about 7 s.
-    const SETTLE: Duration = Duration::from_secs(10);
-    let config = Config::try_from("[options]\n[bindings]\n[overview]\nanimation_speed = 1.0\n")
-        .expect("config parses");
-    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    const SETTLE: Duration = Duration::from_secs(1);
+    let mut harness = TestHarness::new().with_config(springs()).with_windows(3);
     harness.run(vec![Event::MenuOpened { window_id: 0 }, toggle()]);
     harness.advance(SETTLE);
     let w1 = find_window_entity(1, harness.world());
@@ -837,7 +876,8 @@ fn test_overview_focus_move_slides() {
     let (slide, before, _) = drawn(harness.world());
     assert!((slide - 1.0).abs() < f32::EPSILON, "settled after opening");
 
-    harness.run(vec![key(KEY_RIGHT)]);
+    send(&mut harness, key(KEY_RIGHT));
+    harness.advance(Duration::from_millis(60));
     let (slide, during, target) = drawn(harness.world());
     assert!(slide < 1.0, "mid-slide");
     assert!(
@@ -849,6 +889,71 @@ fn test_overview_focus_move_slides() {
     let (slide, after, target) = drawn(harness.world());
     assert!((slide - 1.0).abs() < f32::EPSILON, "settled after the move");
     assert_eq!(after, target);
+}
+
+/// Windows 0 and 1 go to VW1, leaving 2 and 3 on VW0. ↓ switches rows on the
+/// stiffer spring; ← and → then slide within VW1 (at least one of them moves)
+/// back on the softer one.
+#[test]
+#[allow(clippy::float_cmp, reason = "the stiffness is one of two constants")]
+fn test_overview_row_switch_slides_stiffer() {
+    fn stiffness(world: &World) -> f64 {
+        world
+            .get_resource::<Overview>()
+            .expect("still open")
+            .slide_stiffness
+    }
+    TestHarness::new()
+        .with_config(springs())
+        .with_windows(4)
+        .on_iteration(4, |world, _state| {
+            assert_eq!(active_virtual_index(world), 1);
+            assert_eq!(stiffness(world), ROW_SWITCH_STIFFNESS);
+        })
+        .on_iteration(6, |world, _state| {
+            assert_eq!(active_virtual_index(world), 1);
+            assert_eq!(stiffness(world), SLIDE_STIFFNESS);
+        })
+        .run(vec![
+            Event::MenuOpened { window_id: 0 },
+            send_window_down(),
+            send_window_down(),
+            toggle(),
+            key(KEY_DOWN),
+            key(KEY_LEFT),
+            key(KEY_RIGHT),
+        ]);
+}
+
+#[test]
+fn test_overview_toggle_mid_open_reverses_from_where_it_is() {
+    let progress = |harness: &mut TestHarness| {
+        let overview = harness.world().get_resource::<Overview>().expect("open");
+        (overview.phase, overview.progress)
+    };
+    let mut harness = TestHarness::new().with_config(springs()).with_windows(2);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    send(&mut harness, toggle());
+    harness.advance(Duration::from_millis(100));
+    let (phase, opened) = progress(&mut harness);
+    assert_eq!(phase, OverviewPhase::Opening);
+    assert!(opened > 0.0 && opened < 1.0, "mid-open at {opened}");
+
+    send(&mut harness, toggle());
+    harness.advance(Duration::from_millis(20));
+    let (phase, closing) = progress(&mut harness);
+    assert_eq!(phase, OverviewPhase::Closing { activate: None });
+    assert!(
+        closing < opened && closing > 0.5 * opened,
+        "reverses from rest without a jump: {opened} → {closing}"
+    );
+
+    harness.advance(Duration::from_secs(1));
+    assert!(
+        harness.world().get_resource::<Overview>().is_none(),
+        "closed"
+    );
 }
 
 #[test]

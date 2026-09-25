@@ -30,7 +30,6 @@ use crate::commands::{Command, Direction, Operation};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, Windows};
-use crate::ecs::systems::ease_out_factor;
 use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, MissionControlActive,
@@ -85,6 +84,13 @@ pub(crate) fn key_action(keycode: u8, modifiers: Modifiers) -> Option<KeyAction>
 /// How close `progress` must get to its goal before it snaps there.
 const PROGRESS_EPSILON: f32 = 0.001;
 
+/// niri's `overview-open-close`: critically damped, stiffness 800.
+pub const OPEN_CLOSE_STIFFNESS: f64 = 800.0;
+/// niri's `horizontal-view-movement` / `window-movement`.
+pub const SLIDE_STIFFNESS: f64 = 800.0;
+/// niri's `workspace-switch`.
+pub const ROW_SWITCH_STIFFNESS: f64 = 1000.0;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OverviewPhase {
     /// Zooming out, `progress` rising towards 1.
@@ -103,6 +109,11 @@ pub struct Overview {
     pub progress: f32,
     /// 0.0 = tiles at their `from` frames, 1.0 = settled at their zoom frames.
     pub slide: f32,
+    /// Spring velocities of `progress` and `slide`, per second.
+    pub progress_velocity: f32,
+    pub slide_velocity: f32,
+    /// The stiffness of the slide in flight: a row switch is stiffer.
+    pub slide_stiffness: f64,
     /// The tile under the mouse pointer, highlighted.
     pub hovered: Option<Entity>,
     pub layout: OverviewLayout,
@@ -121,6 +132,9 @@ impl Overview {
             phase: OverviewPhase::Opening,
             progress: 0.0,
             slide: 1.0,
+            progress_velocity: 0.0,
+            slide_velocity: 0.0,
+            slide_stiffness: SLIDE_STIFFNESS,
             hovered: None,
             layout: OverviewLayout::default(),
             display,
@@ -136,6 +150,8 @@ impl Overview {
             return;
         }
         self.phase = OverviewPhase::Closing { activate };
+        // Like niri, reverse from where it is, but from rest.
+        self.progress_velocity = 0.0;
         // Tiles must zoom back to where the windows are now, not where they
         // were at the last projection.
         self.reproject = true;
@@ -359,14 +375,24 @@ where
     OverviewLayout { rows }
 }
 
-/// One ease-out step of `progress` towards `goal`, snapping onto it once
-/// within [`PROGRESS_EPSILON`] so the animation ends on exactly 0.0 or 1.0.
-pub fn step_progress(progress: f32, goal: f32, t: f32) -> f32 {
-    let next = progress + (goal - progress) * t;
-    if (goal - next).abs() < PROGRESS_EPSILON {
-        goal
+/// One exact `dt`-second step of a critically damped, unit-mass spring
+/// pulling `value` (moving at `velocity`/s) towards `goal`. Snaps onto the
+/// goal, at rest, once within [`PROGRESS_EPSILON`], so it ends on exactly 0.0
+/// or 1.0. Exact, so the frame rate doesn't change the curve.
+#[allow(clippy::cast_possible_truncation)]
+pub fn spring_step(value: f32, velocity: f32, goal: f32, stiffness: f64, dt: f64) -> (f32, f32) {
+    // x(t) = (x0 + (v0 + ω·x0)·t)·e^(−ωt), x'(t) = (v0 − ω·(v0 + ω·x0)·t)·e^(−ωt)
+    let omega = stiffness.sqrt();
+    let offset = f64::from(value - goal);
+    let velocity = f64::from(velocity);
+    let decay = (-omega * dt).exp();
+    let c = velocity + omega * offset;
+    let offset = (offset + c * dt) * decay;
+    let velocity = (velocity - omega * c * dt) * decay;
+    if offset.abs() < f64::from(PROGRESS_EPSILON) {
+        (goal, 0.0)
     } else {
-        next
+        (goal + offset as f32, velocity as f32)
     }
 }
 
@@ -500,7 +526,7 @@ fn overview_input(
 
 /// Projects the active display's rows into the overview on open, and again
 /// whenever the layout, the focus or the active workspace changes while it is
-/// up, or a close asks for it. The selection is always the focused window.
+/// up, or a close asks for it.
 #[instrument(level = Level::DEBUG, skip_all)]
 #[allow(clippy::too_many_arguments)]
 fn overview_project(
@@ -585,19 +611,31 @@ fn overview_project(
         &|entity| windows.moving_frame(entity),
     );
 
-    // FLIP: every tile already on screen slides from where it's drawn now. A
-    // new tile appears in place, and so does everything on the first projection.
+    // FLIP: every tile already on screen slides from where it's drawn now, from
+    // rest. A new tile appears in place, and so does everything on the first
+    // projection. A row switch moves tiles vertically and slides stiffer; the
+    // focus lags it, so the follow-up horizontal recentre still sees that
+    // vertical motion in flight and keeps the stiffer spring.
     if !overview.is_added() {
         let mut moved = false;
+        let mut vertical = false;
         for tile in layout.rows.iter_mut().flat_map(|row| &mut row.tiles) {
             if let Some((_, old)) = overview.layout.find(tile.entity) {
                 let drawn = old.drawn(overview.progress, overview.slide);
-                moved |= drawn != tile.frame_at(overview.progress);
+                let frame = tile.frame_at(overview.progress);
+                moved |= drawn != frame;
+                vertical |= drawn.min.y != frame.min.y || drawn.max.y != frame.max.y;
                 tile.from = Some(drawn);
             }
         }
         if moved {
             overview.slide = 0.0;
+            overview.slide_velocity = 0.0;
+            overview.slide_stiffness = if vertical {
+                ROW_SWITCH_STIFFNESS
+            } else {
+                SLIDE_STIFFNESS
+            };
         }
     }
 
@@ -665,8 +703,9 @@ fn overview_render(
 }
 
 /// Drives `progress` towards 1.0 while opening and 0.0 while closing, and
-/// `slide` towards 1.0, both at the same rate. A settled, open overview is
-/// left untouched so nothing downstream sees a change.
+/// `slide` towards 1.0, each on its own spring; instantly with animations off.
+/// A settled, open overview is left untouched so nothing downstream sees a
+/// change.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn overview_animate(
     mut overview: ResMut<Overview>,
@@ -678,9 +717,23 @@ fn overview_animate(
     if overview.phase == OverviewPhase::Open && overview.slide >= 1.0 {
         return;
     }
-    let t = ease_out_factor(config.overview_animation_speed(), time.delta_secs_f64());
+    let overview = &mut *overview;
+    let dt = time.delta_secs_f64();
+    let animated = config.animations_enabled();
+    let step = |value, velocity, goal, stiffness| {
+        if animated {
+            spring_step(value, velocity, goal, stiffness, dt)
+        } else {
+            (goal, 0.0)
+        }
+    };
     if overview.slide < 1.0 {
-        overview.slide = step_progress(overview.slide, 1.0, t);
+        (overview.slide, overview.slide_velocity) = step(
+            overview.slide,
+            overview.slide_velocity,
+            1.0,
+            overview.slide_stiffness,
+        );
     }
 
     let goal = match overview.phase {
@@ -688,7 +741,12 @@ fn overview_animate(
         OverviewPhase::Opening => 1.0,
         OverviewPhase::Closing { .. } => 0.0,
     };
-    overview.progress = step_progress(overview.progress, goal, t);
+    (overview.progress, overview.progress_velocity) = step(
+        overview.progress,
+        overview.progress_velocity,
+        goal,
+        OPEN_CLOSE_STIFFNESS,
+    );
 
     match overview.phase {
         OverviewPhase::Opening if overview.progress >= 1.0 => {

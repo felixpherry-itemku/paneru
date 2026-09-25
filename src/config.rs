@@ -717,10 +717,10 @@ impl Config {
         self.inner().overview.clone().unwrap_or_default()
     }
 
-    pub fn overview_animation_speed(&self) -> f64 {
-        self.overview()
-            .animation_speed
-            .map_or_else(|| self.animation_speed(), |speed| speed.max(0.0))
+    /// Unset `options.animation_speed` turns animations off; the overview then
+    /// opens and closes instantly.
+    pub fn animations_enabled(&self) -> bool {
+        self.options().animation_speed.is_some()
     }
 
     pub fn overview_scrim_opacity(&self) -> f32 {
@@ -1210,9 +1210,6 @@ pub struct RestoreOptions {
 /// supply the defaults, so an absent table is valid.
 #[derive(Clone, Debug, Deserialize, Default)]
 pub struct OverviewOptions {
-    /// Ease-out decay rate for the open/close zoom. Falls back to
-    /// `options.animation_speed`.
-    pub animation_speed: Option<f64>,
     /// Alpha of the dim drawn over the wallpaper backdrop once fully open.
     pub scrim_opacity: Option<f32>,
     /// Dim colour as `[r, g, b]` in `0.0..=1.0`; also the solid backdrop when
@@ -2451,12 +2448,15 @@ animation_speed = 12.0
     )
     .expect("config should parse");
 
-    assert!((config.overview_animation_speed() - 12.0).abs() < f64::EPSILON);
+    assert!(config.animations_enabled());
     assert!((config.overview_scrim_opacity() - 0.3).abs() < f32::EPSILON);
     assert_eq!(config.overview_scrim_color(), [0.05, 0.05, 0.07]);
     assert_eq!(config.overview_row_gap(), 24);
     assert_eq!(config.overview_zoom(), 0.5);
     assert!(config.overview_thumbnails());
+
+    let instant = Config::try_from("[options]\n[bindings]\n").expect("config should parse");
+    assert!(!instant.animations_enabled());
 }
 
 #[test]
@@ -2467,6 +2467,7 @@ fn test_overview_config_explicit_values() {
 [options]
 animation_speed = 12.0
 
+# Removed; still parses and is ignored.
 [overview]
 animation_speed = 30.0
 scrim_opacity = 1.5
@@ -2480,7 +2481,6 @@ thumbnails = false
     )
     .expect("config should parse");
 
-    assert!((config.overview_animation_speed() - 30.0).abs() < f64::EPSILON);
     assert!((config.overview_scrim_opacity() - 1.0).abs() < f32::EPSILON);
     assert_eq!(config.overview_scrim_color(), [0.1, 0.2, 0.3]);
     assert_eq!(config.overview_row_gap(), 8);
