@@ -1241,7 +1241,7 @@ fn move_virtual_workspace_bind(
 /// The column of `strip` whose window sits nearest the display's horizontal
 /// centre. Stands in for the focus a strip never had when it is parked, so
 /// that returning to it lands on whatever the user was looking at.
-fn column_closest_to_center(
+pub(crate) fn column_closest_to_center(
     strip: &LayoutStrip,
     display: &Display,
     windows: &Windows,

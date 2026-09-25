@@ -19,7 +19,7 @@ use super::{FocusedMarker, MouseHeldMarker, SystemTheme, Unmanaged};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
-use crate::ecs::workspace::RestoreFocusMarker;
+use crate::ecs::workspace::{RestoreFocusMarker, column_closest_to_center};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, Position, RaiseWindow, ResizeMarker, Scrolling,
     SendMessageTrigger, SpawnCommandsExt, StrayFocusEvent,
@@ -549,18 +549,21 @@ fn raise_window_trigger(
 #[instrument(level = Level::DEBUG, skip_all)]
 fn recover_lost_focus(
     windows: Windows,
-    active_workspace: Query<&LayoutStrip, With<ActiveWorkspaceMarker>>,
+    active_display: ActiveDisplay,
+    focus_history: Res<FocusHistory>,
     mut commands: Commands,
 ) {
-    if windows.focused().is_some() {
+    let strip = active_display.active_strip();
+    // An empty row has nothing to recover to.
+    if windows.focused().is_some() || strip.len() == 0 {
         return;
     }
     error!("Lost focus marker, recovering!");
-    if let Ok(strip) = active_workspace
-        .single()
-        .inspect_err(|err| error!("Unable to get current workspace: {err}"))
-        && let Some(entity) = strip.first().ok().and_then(|col| col.top())
-    {
+    let target = focus_history
+        .last_managed(strip.id())
+        .filter(|column| strip.contains(*column))
+        .or_else(|| column_closest_to_center(strip, active_display.display(), &windows));
+    if let Some(entity) = target {
         commands.focus_entity(entity, false);
     }
 }
