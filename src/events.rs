@@ -210,6 +210,15 @@ pub enum Event {
         height: u32,
         rgba: Vec<u8>,
     },
+    /// The display's desktop picture, captured for the overview backdrop when
+    /// its file can't be read. Plain RGBA bytes, like `OverviewThumbnail`.
+    #[cfg_attr(not(feature = "thumbnails"), allow(dead_code))]
+    OverviewWallpaper {
+        display_id: CGDirectDisplayID,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
 
     /// A command has been issued to the window manager.
     Command { command: Command },

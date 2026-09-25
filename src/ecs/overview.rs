@@ -803,8 +803,9 @@ fn finish_close(
     commands.remove_resource::<Overview>();
 }
 
-/// Hands arriving thumbnails to the renderer. One for a window that is no
-/// longer projected — closed since the capture was requested — is dropped.
+/// Hands arriving thumbnails and wallpaper captures to the renderer. A
+/// thumbnail for a window that is no longer projected — closed since the
+/// capture was requested — is dropped.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn overview_thumbnail(
     mut messages: MessageReader<Event>,
@@ -814,27 +815,39 @@ fn overview_thumbnail(
 ) {
     let mut renderer = renderer;
     for event in messages.read() {
-        let Event::OverviewThumbnail {
-            window_id,
-            width,
-            height,
-            rgba,
-        } = event
-        else {
+        let Some(renderer) = renderer.as_mut() else {
             continue;
         };
-        let projected = overview
-            .layout
-            .rows
-            .iter()
-            .flat_map(|row| &row.tiles)
-            .any(|tile| {
-                windows
-                    .get(tile.entity)
-                    .is_some_and(|window| window.id() == *window_id)
-            });
-        if let Some(renderer) = renderer.as_mut().filter(|_| projected) {
-            renderer.store_thumbnail(*window_id, *width, *height, rgba.clone());
+        match event {
+            Event::OverviewThumbnail {
+                window_id,
+                width,
+                height,
+                rgba,
+            } => {
+                let projected =
+                    overview
+                        .layout
+                        .rows
+                        .iter()
+                        .flat_map(|row| &row.tiles)
+                        .any(|tile| {
+                            windows
+                                .get(tile.entity)
+                                .is_some_and(|window| window.id() == *window_id)
+                        });
+                if projected {
+                    renderer.store_thumbnail(*window_id, *width, *height, rgba.clone());
+                }
+            }
+            // The renderer knows which display's capture it is waiting for.
+            Event::OverviewWallpaper {
+                display_id,
+                width,
+                height,
+                rgba,
+            } => renderer.store_wallpaper(*display_id, *width, *height, rgba.clone()),
+            _ => {}
         }
     }
 }

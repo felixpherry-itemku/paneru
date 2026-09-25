@@ -287,6 +287,22 @@ impl OverviewView {
     }
 }
 
+/// Rebuilds an image, here on the main thread, from the plain RGBA bytes a
+/// capture callback sent.
+fn rgba_image(width: u32, height: u32, mut rgba: Vec<u8>) -> Option<Retained<NSImage>> {
+    let (width, height) = (usize::try_from(width).ok()?, usize::try_from(height).ok()?);
+    if rgba.len() < width * height * 4 {
+        return None;
+    }
+    let context = unsafe { rgba_bitmap_context(rgba.as_mut_ptr().cast(), width, height) }?;
+    let image = CGBitmapContextCreateImage(Some(&context))?;
+    Some(NSImage::initWithCGImage_size(
+        NSImage::alloc(),
+        &image,
+        NSSize::ZERO,
+    ))
+}
+
 /// Owns the overview window. Exists for the process lifetime; the window only
 /// while the overview is open.
 pub struct OverviewRenderer {
@@ -301,6 +317,12 @@ pub struct OverviewRenderer {
     /// The last desktop picture decoded, keyed by its URL. Kept across opens,
     /// so only the first open pays for decoding it.
     wallpaper: Option<(String, Retained<NSImage>)>,
+    /// Desktop pictures captured because their file couldn't be loaded, per
+    /// display. Kept across opens: shown at once, then refreshed by each open.
+    captured: HashMap<CGDirectDisplayID, Retained<NSImage>>,
+    /// The display whose captured picture this open shows, so a capture
+    /// arriving for it replaces the backdrop.
+    awaiting: Option<CGDirectDisplayID>,
 }
 
 impl OverviewRenderer {
@@ -312,6 +334,8 @@ impl OverviewRenderer {
             events,
             requested: HashSet::new(),
             wallpaper: None,
+            captured: HashMap::new(),
+            awaiting: None,
         }
     }
 
@@ -342,8 +366,14 @@ impl OverviewRenderer {
         let frame = cg_abs_to_cocoa(ns_rect(scene.display), primary_screen_height(self.mtm));
         let resized = self.scene.as_ref().map(|old| old.display) != Some(scene.display);
         // Also true on the first frame of an open: `close` forgets the scene.
-        let wallpaper = (self.scene.as_ref().map(|old| old.display_id) != Some(scene.display_id))
-            .then(|| self.wallpaper(scene.display_id));
+        let first = self.scene.as_ref().map(|old| old.display_id) != Some(scene.display_id);
+        // An unreadable wallpaper file falls back to the last capture of the
+        // display, if any, until this open's own capture lands.
+        let wallpaper = first.then(|| {
+            let file = self.wallpaper(scene.display_id);
+            self.awaiting = file.is_none().then_some(scene.display_id);
+            file.or_else(|| self.captured.get(&scene.display_id).cloned())
+        });
         let (window, view) = self.window.get_or_insert_with(|| {
             let window = make_overlay_window(self.mtm, frame);
             // Above every application window, the menu bar and the Dock.
@@ -379,13 +409,25 @@ impl OverviewRenderer {
         }
         view.setNeedsDisplay(true);
 
+        let scale = window.backingScaleFactor();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let pixels = |points: i32| (f64::from(points) * scale).round().max(1.0) as u32;
+        // Right away, unlike thumbnails: the capture overlaps the fade-in.
+        #[cfg(feature = "thumbnails")]
+        if first && scene.thumbnails && self.awaiting == Some(scene.display_id) {
+            crate::manager::capture::request_wallpaper(
+                scene.display_id,
+                scene.display,
+                pixels(scene.display.width()),
+                pixels(scene.display.height()),
+                self.events.clone(),
+            );
+        }
+
         // Only once the window is up and settled: a slow capture round-trip
         // must never hold up the open animation, and settled tiles have their
         // final size to capture at.
         if scene.thumbnails && scene.progress >= 1.0 {
-            let scale = window.backingScaleFactor();
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let pixels = |points: i32| (f64::from(points) * scale).round().max(1.0) as u32;
             let requests = scene
                 .tiles
                 .iter()
@@ -406,38 +448,40 @@ impl OverviewRenderer {
         self.scene = Some(scene);
     }
 
-    /// Caches a captured thumbnail, rebuilding the image here on the main
-    /// thread from the plain RGBA bytes the capture callback sent.
-    pub fn store_thumbnail(
-        &mut self,
-        window_id: WinID,
-        width: u32,
-        height: u32,
-        mut rgba: Vec<u8>,
-    ) {
+    /// Caches a captured thumbnail.
+    pub fn store_thumbnail(&mut self, window_id: WinID, width: u32, height: u32, rgba: Vec<u8>) {
         let Some((_, view)) = &self.window else {
             return;
         };
-        let (Ok(width), Ok(height)) = (usize::try_from(width), usize::try_from(height)) else {
+        let Some(image) = rgba_image(width, height, rgba) else {
             return;
         };
-        if rgba.len() < width * height * 4 {
-            return;
-        }
-        let Some(context) =
-            (unsafe { rgba_bitmap_context(rgba.as_mut_ptr().cast(), width, height) })
-        else {
-            return;
-        };
-        let Some(image) = CGBitmapContextCreateImage(Some(&context)) else {
-            return;
-        };
-        let image = NSImage::initWithCGImage_size(NSImage::alloc(), &image, NSSize::ZERO);
         view.ivars()
             .borrow_mut()
             .thumbnails
             .insert(window_id, image);
         view.setNeedsDisplay(true);
+    }
+
+    /// Caches a captured desktop picture, and shows it if this open is
+    /// waiting for one of that display.
+    pub fn store_wallpaper(
+        &mut self,
+        display_id: CGDirectDisplayID,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    ) {
+        let Some(image) = rgba_image(width, height, rgba) else {
+            return;
+        };
+        self.captured.insert(display_id, image.clone());
+        if let Some((_, view)) = &self.window
+            && self.awaiting == Some(display_id)
+        {
+            view.ivars().borrow_mut().wallpaper = Some(image);
+            view.setNeedsDisplay(true);
+        }
     }
 
     /// Takes the window down and forgets everything drawn in it.
@@ -451,6 +495,7 @@ impl OverviewRenderer {
         }
         self.scene = None;
         self.requested.clear();
+        self.awaiting = None;
     }
 }
 

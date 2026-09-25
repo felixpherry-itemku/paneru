@@ -257,7 +257,8 @@ impl TryFrom<&Event> for LuaEvent {
             | Event::StateSubscribe { .. }
             | Event::ScriptState { .. }
             | Event::OverviewKey { .. }
-            | Event::OverviewThumbnail { .. } => return Err(NotMarshallable),
+            | Event::OverviewThumbnail { .. }
+            | Event::OverviewWallpaper { .. } => return Err(NotMarshallable),
         })
     }
 }
