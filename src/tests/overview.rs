@@ -1,5 +1,7 @@
 //! Tests for the overview (`src/ecs/overview.rs`).
 
+use std::collections::HashMap;
+
 use bevy::ecs::entity::Entity;
 use bevy::ecs::system::SystemState;
 use bevy::ecs::world::World;
@@ -550,6 +552,7 @@ fn test_overview_mid_frame_only_while_animating() {
                 layout: OverviewLayout::default(),
                 display: 0,
                 reproject: false,
+                centres: HashMap::new(),
             });
         }
         let mut state = SystemState::<FrameActivity>::new(&mut world);

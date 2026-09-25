@@ -5,6 +5,8 @@
 //! The `Overview` resource exists exactly while the overview is on screen, and
 //! every system here is gated on it so nothing is scheduled while it is shut.
 
+use std::collections::HashMap;
+
 use bevy::app::{App, Plugin, PostUpdate, PreUpdate};
 use bevy::ecs::change_detection::DetectChanges;
 use bevy::ecs::entity::Entity;
@@ -26,6 +28,7 @@ use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::params::{ActiveDisplay, Windows};
 use crate::ecs::systems::ease_out_factor;
+use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{
     ActiveDisplayMarker, ActiveWorkspaceMarker, FocusedMarker, MissionControlActive,
     SendMessageTrigger, SpawnCommandsExt,
@@ -104,6 +107,9 @@ pub struct Overview {
     pub display: CGDirectDisplayID,
     /// Asks `overview_project` to re-project once, even with nothing changed.
     pub reproject: bool,
+    /// Each row's centre window (row strip → window), so a row keeps its place
+    /// while neither its focus nor its remembered focus is known.
+    pub centres: HashMap<Entity, Entity>,
 }
 
 impl Overview {
@@ -116,6 +122,7 @@ impl Overview {
             layout: OverviewLayout::default(),
             display,
             reproject: false,
+            centres: HashMap::new(),
         }
     }
 
@@ -469,12 +476,18 @@ fn overview_input(
 fn overview_project(
     mut overview: ResMut<Overview>,
     active_display: ActiveDisplay,
-    strips: Query<(Entity, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    strips: Query<(
+        Entity,
+        &LayoutStrip,
+        Has<ActiveWorkspaceMarker>,
+        Option<&PreviousStripPosition>,
+    )>,
     changed_strips: Query<(), Changed<LayoutStrip>>,
     // `Changed`, not `Added`: re-inserting a marker on the same entity
     // doesn't count as adding it.
     changed_focus: Query<(), Changed<FocusedMarker>>,
     changed_workspace: Query<(), Changed<ActiveWorkspaceMarker>>,
+    changed_previous: Query<(), Changed<PreviousStripPosition>>,
     mut removed_windows: RemovedComponents<Window>,
     mut removed_focus: RemovedComponents<FocusedMarker>,
     windows: Windows,
@@ -490,6 +503,7 @@ fn overview_project(
         && changed_strips.is_empty()
         && changed_focus.is_empty()
         && changed_workspace.is_empty()
+        && changed_previous.is_empty()
     {
         return;
     }
@@ -498,27 +512,48 @@ fn overview_project(
     let workspace_id = active_display.active_strip().id();
     let rows = strips
         .iter()
-        .filter(|(_, strip, _)| strip.id() == workspace_id)
+        .filter(|(_, strip, _, _)| strip.id() == workspace_id)
         .collect::<Vec<_>>();
-    let layout = project(
-        &rows
-            .iter()
-            .map(|&(entity, strip, is_active)| (entity, strip, is_active, None))
-            .collect::<Vec<_>>(),
-        active_display.actual_bounds(&config),
-        OverviewConfig::from(config.as_ref()),
-        &|entity| windows.moving_frame(entity),
-    );
 
     // A focused tab stands for its whole group, whose tile carries the group's
     // first member. Focus on a window with no tile (floating, unmanaged, on
     // another display) selects nothing.
     let focused = windows.focused().map(|(_, entity)| {
         rows.iter()
-            .find_map(|(_, strip, _)| strip.tab_group(entity))
+            .find_map(|(_, strip, _, _)| strip.tab_group(entity))
             .and_then(|group| group.first().copied())
             .unwrap_or(entity)
     });
+
+    // The active row centres on the focus, the others on the window ↑/↓ would
+    // focus there. Until that's known (the focus lags a row switch), a row
+    // stays on its last centre, and only a fresh row starts on its first column.
+    let rows = rows
+        .iter()
+        .map(|&(entity, strip, is_active, previous)| {
+            let own = if is_active {
+                focused
+            } else {
+                previous.and_then(|previous| previous.focus)
+            };
+            let centre = own
+                .into_iter()
+                .chain(overview.centres.get(&entity).copied())
+                .find(|window| strip.contains(*window))
+                .or_else(|| strip.first().ok().and_then(|column| column.top()));
+            (entity, strip, is_active, centre)
+        })
+        .collect::<Vec<_>>();
+    overview.centres = rows
+        .iter()
+        .filter_map(|&(entity, _, _, centre)| Some((entity, centre?)))
+        .collect();
+    let layout = project(
+        &rows,
+        active_display.actual_bounds(&config),
+        OverviewConfig::from(config.as_ref()),
+        &|entity| windows.moving_frame(entity),
+    );
     overview.selected = focused.filter(|entity| layout.find(*entity).is_some());
     if overview
         .hovered
