@@ -2,9 +2,13 @@
 //! ECS each frame, and the [`OverviewRenderer`] that shows it as a Core
 //! Animation layer tree in a borderless window above every application.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+#[cfg(feature = "thumbnails")]
+use std::sync::Arc;
 
 use bevy::math::{IRect, IVec2};
+#[cfg(feature = "thumbnails")]
+use dispatch2::MainThreadBound;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, define_class, msg_send};
@@ -15,6 +19,8 @@ use objc2_app_kit::{
 use objc2_core_foundation::{CFRetained, CFType, CGFloat};
 use objc2_core_graphics::{CGBitmapContextCreateImage, CGColor, CGDirectDisplayID};
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+#[cfg(feature = "thumbnails")]
+use objc2_io_surface::IOSurfaceRef;
 use objc2_quartz_core::{
     CALayer, CATextLayer, CATransaction, kCAAlignmentCenter, kCAGravityResize,
     kCAGravityResizeAspect, kCAGravityResizeAspectFill, kCATruncationEnd,
@@ -22,6 +28,8 @@ use objc2_quartz_core::{
 
 use super::{cg_abs_to_cocoa, make_overlay_window, primary_screen_height};
 use crate::events::EventSender;
+#[cfg(feature = "thumbnails")]
+use crate::manager::capture::{self, FrameSink, LiveStream};
 use crate::platform::input::set_overview_window;
 use crate::platform::{Pid, WinID};
 use crate::util::{read_screen_property, rgba_bitmap_context};
@@ -72,6 +80,34 @@ fn local_rect(rect: IRect, origin: IVec2) -> NSRect {
 
 fn srgb(rgb: [f64; 3], alpha: f64) -> CFRetained<CGColor> {
     CGColor::new_srgb(rgb[0], rgb[1], rgb[2], alpha)
+}
+
+/// The streams to start and to stop: a tile streams while its settled frame is
+/// on `display`. Judged on `target` rather than the drawn frame, which moves
+/// every frame of the zoom and of a slide.
+#[cfg_attr(not(feature = "thumbnails"), allow(dead_code))]
+fn stream_changes(
+    running: &HashSet<WinID>,
+    tiles: &[SceneTile],
+    display: IRect,
+) -> (Vec<WinID>, Vec<WinID>) {
+    let wanted = tiles
+        .iter()
+        .filter(|tile| tile.window_id != 0 && !tile.target.intersect(display).is_empty())
+        .map(|tile| tile.window_id)
+        .collect::<Vec<_>>();
+    let start = wanted
+        .iter()
+        .copied()
+        .filter(|id| !running.contains(id))
+        .collect();
+    let mut stop = running
+        .iter()
+        .copied()
+        .filter(|id| !wanted.contains(id))
+        .collect::<Vec<_>>();
+    stop.sort_unstable();
+    (start, stop)
 }
 
 /// Runs `changes` with Core Animation's implicit animations off. Otherwise
@@ -189,6 +225,32 @@ impl TileLayers {
         // SAFETY: an `NSString` is one of the types `string` takes.
         unsafe { self.title.setString(Some(&NSString::from_str(&caption))) };
     }
+
+    /// Shows each frame of this tile's stream in `content`, in place of the
+    /// icon and title.
+    #[cfg(feature = "thumbnails")]
+    fn sink(&self, mtm: MainThreadMarker) -> FrameSink {
+        let Self {
+            content,
+            icon,
+            title,
+            ..
+        } = self.clone();
+        Arc::new(MainThreadBound::new(
+            Box::new(move |surface: &IOSurfaceRef| {
+                without_animation(|| {
+                    let surface = std::ptr::from_ref(surface).cast::<AnyObject>();
+                    // SAFETY: an `IOSurface` is one of the types `contents`
+                    // takes, and `IOSurfaceRef` is toll-free bridged with it.
+                    unsafe { content.setContents(Some(&*surface)) };
+                    content.setHidden(false);
+                    icon.setHidden(true);
+                    title.setHidden(true);
+                });
+            }),
+            mtm,
+        ))
+    }
 }
 
 define_class!(
@@ -298,6 +360,9 @@ pub struct OverviewRenderer {
     awaiting: Option<CGDirectDisplayID>,
     /// Each projected window's layers, created on its first frame.
     tiles: HashMap<WinID, TileLayers>,
+    /// A live stream per tile whose settled frame is on the display.
+    #[cfg(feature = "thumbnails")]
+    streams: HashMap<WinID, LiveStream>,
 }
 
 impl OverviewRenderer {
@@ -311,6 +376,8 @@ impl OverviewRenderer {
             captured: HashMap::new(),
             awaiting: None,
             tiles: HashMap::new(),
+            #[cfg(feature = "thumbnails")]
+            streams: HashMap::new(),
         }
     }
 
@@ -412,6 +479,31 @@ impl OverviewRenderer {
                 self.events.clone(),
             );
         }
+        // From the first frame of the open, so content can arrive mid-zoom.
+        #[cfg(feature = "thumbnails")]
+        if scene.thumbnails {
+            let running = self.streams.keys().copied().collect();
+            let (start, stop) = stream_changes(&running, &scene.tiles, scene.display);
+            for id in stop {
+                self.streams.remove(&id);
+            }
+            // ponytail: sized once at start; a window resized while open keeps
+            // its stream size and `kCAGravityResize` scales it. Reconfigure
+            // with `updateConfiguration` if that looks soft.
+            let requests = scene
+                .tiles
+                .iter()
+                .filter(|tile| start.contains(&tile.window_id))
+                .filter_map(|tile| {
+                    let sink = self.tiles.get(&tile.window_id)?.sink(mtm);
+                    let (width, height) = (tile.target.width(), tile.target.height());
+                    Some((tile.window_id, pixels(width), pixels(height), sink))
+                })
+                .collect();
+            self.streams.extend(capture::start_streams(requests));
+        } else {
+            self.streams.clear();
+        }
 
         self.scene = Some(scene);
     }
@@ -439,6 +531,9 @@ impl OverviewRenderer {
 
     /// Takes the window down and forgets everything drawn in it.
     pub fn close(&mut self) {
+        // Nothing records while the overview is closed.
+        #[cfg(feature = "thumbnails")]
+        self.streams.clear();
         set_overview_window(0);
         if let Some(stage) = self.window.take() {
             stage.window.orderOut(None::<&AnyObject>);
@@ -446,5 +541,68 @@ impl OverviewRenderer {
         self.tiles.clear();
         self.scene = None;
         self.awaiting = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DISPLAY: IRect = IRect {
+        min: IVec2::new(0, 0),
+        max: IVec2::new(1000, 800),
+    };
+
+    fn tile(window_id: WinID, target: IRect) -> SceneTile {
+        SceneTile {
+            window_id,
+            pid: 0,
+            frame: target,
+            target,
+            title: String::new(),
+            tab_count: 1,
+            hovered: false,
+        }
+    }
+
+    #[test]
+    fn test_stream_changes_starts_tiles_inside_and_partly_inside_the_display() {
+        let tiles = [
+            tile(1, IRect::new(100, 100, 400, 300)),
+            tile(2, IRect::new(900, 100, 1200, 300)),
+            tile(3, IRect::new(1100, 100, 1400, 300)),
+            // Touching the edge only: nothing of it is on screen.
+            tile(4, IRect::new(1000, 100, 1300, 300)),
+        ];
+        let (start, stop) = stream_changes(&HashSet::new(), &tiles, DISPLAY);
+        assert_eq!(start, vec![1, 2]);
+        assert!(stop.is_empty());
+    }
+
+    #[test]
+    fn test_stream_changes_after_a_slide_starts_the_new_and_stops_the_gone() {
+        let running = HashSet::from([1, 2, 3]);
+        let tiles = [
+            tile(1, IRect::new(-500, 100, -200, 300)),
+            tile(2, IRect::new(0, 100, 300, 300)),
+            tile(3, IRect::new(350, 100, 650, 300)),
+            tile(4, IRect::new(700, 100, 1000, 300)),
+        ];
+        let (start, stop) = stream_changes(&running, &tiles, DISPLAY);
+        assert_eq!(start, vec![4]);
+        assert_eq!(stop, vec![1]);
+    }
+
+    #[test]
+    fn test_stream_changes_is_empty_when_running_matches_and_skips_no_window() {
+        let running = HashSet::from([1, 2]);
+        let tiles = [
+            tile(1, IRect::new(0, 100, 300, 300)),
+            tile(2, IRect::new(350, 100, 650, 300)),
+            tile(0, IRect::new(700, 100, 1000, 300)),
+        ];
+        let (start, stop) = stream_changes(&running, &tiles, DISPLAY);
+        assert!(start.is_empty(), "{start:?}");
+        assert!(stop.is_empty(), "{stop:?}");
     }
 }

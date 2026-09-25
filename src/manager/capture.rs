@@ -11,10 +11,6 @@
 //! and the overview keeps drawing its icon + title tile, or its scrim-coloured
 //! backdrop. Nothing ever errors.
 
-// The stream half is unused between the Phase 1 probe's removal and Phase 4's
-// renderer hookup; Phase 4 deletes this.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 

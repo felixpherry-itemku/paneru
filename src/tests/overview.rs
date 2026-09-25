@@ -851,6 +851,47 @@ fn test_overview_focus_move_slides() {
     assert_eq!(after, target);
 }
 
+/// Streams are sized and picked from each tile's settled frame on the first
+/// frame of the open, so that frame has to be known before the zoom lands.
+#[test]
+fn test_overview_target_is_known_on_the_first_frame() {
+    const SETTLE: Duration = Duration::from_secs(10);
+    let config = Config::try_from("[options]\n[bindings]\n[overview]\nanimation_speed = 1.0\n")
+        .expect("config parses");
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }, toggle()]);
+    let tiles = |world: &World| {
+        let overview = world.get_resource::<Overview>().expect("overview open");
+        overview
+            .layout
+            .rows
+            .iter()
+            .flat_map(|row| &row.tiles)
+            .map(|tile| {
+                let drawn = tile.drawn(overview.progress, overview.slide);
+                (tile.entity, drawn, tile.target)
+            })
+            .collect::<Vec<_>>()
+    };
+    let overview = harness.world().resource::<Overview>();
+    assert!(overview.progress < 1.0, "still zooming");
+    let first = tiles(harness.world());
+    assert!(
+        first.iter().any(|(_, drawn, target)| drawn != target),
+        "mid-zoom: {first:?}"
+    );
+
+    harness.advance(SETTLE);
+    let settled = tiles(harness.world());
+    for (entity, _, target) in first {
+        let drawn = settled
+            .iter()
+            .find(|(settled, ..)| *settled == entity)
+            .map(|(_, drawn, _)| *drawn);
+        assert_eq!(drawn, Some(target), "{entity:?}");
+    }
+}
+
 #[test]
 fn test_overview_arrow_down_switches_workspace_while_open() {
     TestHarness::new()
