@@ -7,6 +7,7 @@ use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With, Without};
 use bevy::ecs::system::{Commands, NonSendMut, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
+use bevy::time::Time;
 use notify::event::{DataChange, MetadataKind, ModifyKind};
 use notify::{EventKind, Watcher};
 use std::cmp::Ordering;
@@ -202,9 +203,10 @@ pub(super) fn theme_change_trigger(
 /// * `restore_guards` - Guards absorbing the OS acknowledgment of a restored focus.
 /// * `focus_history` - Per-workspace record of what was focused last.
 /// * `global_state` - Focus-follows-mouse and reshuffle flags.
+/// * `time` - When the focus moved, for the close hand-off's grace window.
 /// * `ctx` - Window queries, configuration and the command buffer.
 #[instrument(level = Level::DEBUG, skip_all)]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn window_focused_trigger(
     mut messages: MessageReader<Event>,
     applications: Query<&Application>,
@@ -212,6 +214,7 @@ pub(super) fn window_focused_trigger(
     restore_guards: Query<(Entity, &RestoreFocusMarker)>,
     mut focus_history: ResMut<FocusHistory>,
     global_state: GlobalState,
+    time: Res<Time>,
     mut ctx: WindowCtx,
 ) {
     const STRAY_FOCUS_RETRY_SEC: u64 = 2;
@@ -332,7 +335,7 @@ pub(super) fn window_focused_trigger(
         // same entity would otherwise skip the write.
         if let Some(workspace_id) = owning_workspace_id.or(active_workspace_id) {
             let unmanaged = ctx.windows.get_managed(entity).and_then(|(_, _, u)| u);
-            focus_history.record(workspace_id, entity, unmanaged);
+            focus_history.record(workspace_id, entity, unmanaged, time.elapsed());
         }
 
         // The restore guard absorbs the OS focus acknowledgment from a restore;
@@ -632,21 +635,22 @@ pub(super) fn window_unmanaged_trigger(
     // Drop the strip membership first, before anything below can bail early —
     // a floating window still reserves column space in the strip otherwise,
     // leaving a gap that never closes on its own.
-    // niri: the active column hands its role to the column now at its index,
-    // or to the new last column when it was the last one.
+    // niri: the active column hands its role to the next window down its
+    // stack, else up; otherwise to the column now at its index, or to the new
+    // last column when it was the last one. A column that survives keeps the
+    // role, so the column it was tiled back beside doesn't apply.
     for (mut strip, _) in &mut workspaces {
         let Ok(index) = strip.index_of(entity) else {
             continue;
         };
+        let successor = strip.successor(entity);
+        let same_column = successor.is_some_and(|next| strip.index_of(next).ok() == Some(index));
         strip.remove(entity);
-        let columns = strip.all_columns();
-        let successor = columns
-            .get(index.min(columns.len().saturating_sub(1)))
-            .copied();
         focus_history.hand_off(
             strip.id(),
             entity,
-            |column| strip.contains(column),
+            None,
+            |column| !same_column && strip.contains(column),
             successor,
         );
     }

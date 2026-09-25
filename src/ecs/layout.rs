@@ -671,6 +671,23 @@ impl LayoutStrip {
             .and_then(|col| col.at_or_last(stack_pos))
     }
 
+    /// niri: the next window down its stack, else up; otherwise the column
+    /// that slides into its index, else the left neighbour.
+    pub fn successor(&self, entity: Entity) -> Option<Entity> {
+        let index = self.index_of(entity).ok()?;
+        if let Some(Column::Stack(stack)) = self.columns.get(index)
+            && stack.len() > 1
+            && let Some(pos) = stack.iter().position(|item| item.contains(entity))
+        {
+            return stack
+                .get(pos + 1)
+                .or_else(|| pos.checked_sub(1).and_then(|above| stack.get(above)))
+                .and_then(StackItem::top);
+        }
+        self.right_neighbour(entity)
+            .or_else(|| self.left_neighbour(entity))
+    }
+
     /// Stacks the window with the given ID onto the panel to its left.
     /// If the window is already in a stack or is the leftmost window, no action is taken.
     ///
@@ -2344,5 +2361,42 @@ mod tests {
         }
         assert_eq!(strip.right_neighbour(leader), Some(b));
         assert_eq!(strip.right_neighbour(follower), Some(b));
+    }
+
+    #[test]
+    fn successor_is_the_right_neighbour_else_the_left() {
+        let (_world, mut strip, entities) = setup_world_and_strip();
+        let [a, b, c] = [entities[0], entities[1], entities[2]];
+
+        assert_eq!(strip.successor(a), Some(b));
+        assert_eq!(strip.successor(b), Some(c));
+        assert_eq!(strip.successor(c), Some(b));
+
+        strip.remove(b);
+        strip.remove(c);
+        assert_eq!(strip.successor(a), None);
+    }
+
+    #[test]
+    fn successor_stays_in_a_stack_and_matches_neighbours_across_stacks() {
+        let (mut world, mut strip, entities) = setup_world_and_strip();
+        let [x, y, z] = [entities[0], entities[1], entities[2]];
+        strip.stack(y).unwrap();
+        strip.stack(z).unwrap();
+
+        // Stack [X, Y, Z]: the next one down, else the one above.
+        assert_eq!(strip.successor(x), Some(y));
+        assert_eq!(strip.successor(y), Some(z));
+        assert_eq!(strip.successor(z), Some(y));
+
+        // A single column beside a stack lands where a keyboard move would.
+        let left = world.spawn_empty().id();
+        strip.insert_at(0, left);
+        let right = world.spawn_empty().id();
+        strip.append(right);
+        assert_eq!(strip.successor(left), Some(x));
+        assert_eq!(strip.successor(left), strip.right_neighbour(left));
+        assert_eq!(strip.successor(right), Some(x));
+        assert_eq!(strip.successor(right), strip.left_neighbour(right));
     }
 }

@@ -30,14 +30,31 @@ use crate::platform::WorkspaceId;
 
 const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
 
+/// How long after losing focus a closing window still counts as focused.
+/// An app that closes one of several windows can focus its own next window
+/// before the close reaches us. // ponytail: fixed heuristic — a window that
+/// closes by itself within this long after the user moved off it still hands
+/// focus on; tie it to the same app if that ever bites.
+const CLOSE_FOCUS_GRACE: Duration = Duration::from_millis(500);
+
+/// The tiled window that was `last_managed` before the current one.
+#[derive(Clone, Copy)]
+struct Handover {
+    entity: Entity,
+    return_to: Option<Entity>,
+    at: Duration,
+}
+
 #[derive(Default)]
 pub struct TierMemory {
     pub last_managed: Option<Entity>,
     pub last_floating: Option<Entity>,
     /// niri's `activate_prev_column_on_removal`: the column `last_managed` was
-    /// tiled back beside. If `last_managed` floats again before another tiled
-    /// window is focused, this column becomes the active one again.
+    /// opened or tiled back beside. If `last_managed` closes or floats again
+    /// before another tiled window is focused, this column becomes the active
+    /// one again.
     return_to: Option<Entity>,
+    previous: Option<Handover>,
 }
 
 /// Keyed by `WorkspaceId` so toggling on one Space can't reach a window last
@@ -56,13 +73,21 @@ impl FocusHistory {
         workspace: WorkspaceId,
         entity: Entity,
         unmanaged: Option<&Unmanaged>,
+        now: Duration,
     ) {
         let slot = self.by_workspace.entry(workspace).or_default();
         match unmanaged {
             None => {
                 // Re-recording the same window (the OS echoing focus) keeps
-                // the flag; any other tiled window taking focus drops it.
+                // the flag; any other tiled window taking focus drops it, but
+                // the outgoing one keeps its flag in `previous` in case it is
+                // closing.
                 if slot.last_managed != Some(entity) {
+                    slot.previous = slot.last_managed.map(|entity| Handover {
+                        entity,
+                        return_to: slot.return_to,
+                        at: now,
+                    });
                     slot.return_to = None;
                 }
                 slot.last_managed = Some(entity);
@@ -80,28 +105,39 @@ impl FocusHistory {
         slot.return_to = anchor;
     }
 
-    /// `entity` left the strip of `workspace` by floating. If it was the active
-    /// column, the role goes to the column it was tiled back beside (when that
-    /// is `still_there`), otherwise to `successor`.
+    /// `entity` left the strip of `workspace` by closing (`now` is `Some`) or
+    /// floating (`None`). If it was the active column, or is closing and lost
+    /// that role within `CLOSE_FOCUS_GRACE`, the role goes to the column it was
+    /// opened or tiled back beside (when that is `still_there`), otherwise to
+    /// `successor`. Returns the new active column; `None` means `entity` wasn't
+    /// the active column and focus must not move.
     pub fn hand_off(
         &mut self,
         workspace: WorkspaceId,
         entity: Entity,
+        now: Option<Duration>,
         still_there: impl Fn(Entity) -> bool,
         successor: Option<Entity>,
-    ) {
-        let Some(slot) = self.by_workspace.get_mut(&workspace) else {
-            return;
+    ) -> Option<Entity> {
+        let slot = self.by_workspace.get_mut(&workspace)?;
+        let anchor = if slot.last_managed == Some(entity) {
+            slot.return_to
+        } else if let Some(now) = now
+            && let Some(previous) = slot.previous.filter(|previous| {
+                previous.entity == entity && now.saturating_sub(previous.at) <= CLOSE_FOCUS_GRACE
+            })
+        {
+            previous.return_to
+        } else {
+            if slot.return_to == Some(entity) {
+                slot.return_to = None;
+            }
+            return None;
         };
-        if slot.last_managed == Some(entity) {
-            slot.last_managed = slot
-                .return_to
-                .take()
-                .filter(|column| still_there(*column))
-                .or(successor);
-        } else if slot.return_to == Some(entity) {
-            slot.return_to = None;
-        }
+        slot.last_managed = anchor.filter(|column| still_there(*column)).or(successor);
+        slot.return_to = None;
+        slot.previous = None;
+        slot.last_managed
     }
 
     pub fn last_managed(&self, workspace: WorkspaceId) -> Option<Entity> {
@@ -130,6 +166,12 @@ impl FocusHistory {
             }
             if slot.last_floating == Some(entity) {
                 slot.last_floating = None;
+            }
+            slot.previous.take_if(|previous| previous.entity == entity);
+            if let Some(previous) = &mut slot.previous
+                && previous.return_to == Some(entity)
+            {
+                previous.return_to = None;
             }
         }
     }
@@ -558,8 +600,8 @@ mod tests {
         let floating = world.spawn(()).id();
         let mut history = FocusHistory::default();
 
-        history.record(1, managed, None);
-        history.record(1, floating, Some(&Unmanaged::Floating));
+        history.record(1, managed, None, Duration::ZERO);
+        history.record(1, floating, Some(&Unmanaged::Floating), Duration::ZERO);
 
         assert_eq!(history.last_managed(1), Some(managed));
         assert_eq!(history.last_floating(1), Some(floating));
@@ -571,8 +613,8 @@ mod tests {
         let entity = world.spawn(()).id();
         let mut history = FocusHistory::default();
 
-        history.record(1, entity, Some(&Unmanaged::Minimized));
-        history.record(1, entity, Some(&Unmanaged::Hidden));
+        history.record(1, entity, Some(&Unmanaged::Minimized), Duration::ZERO);
+        history.record(1, entity, Some(&Unmanaged::Hidden), Duration::ZERO);
 
         assert_eq!(history.last_managed(1), None);
         assert_eq!(history.last_floating(1), None);
@@ -585,8 +627,8 @@ mod tests {
         let b = world.spawn(()).id();
         let mut history = FocusHistory::default();
 
-        history.record(1, a, None);
-        history.record(2, b, None);
+        history.record(1, a, None, Duration::ZERO);
+        history.record(2, b, None, Duration::ZERO);
 
         assert_eq!(history.last_managed(1), Some(a));
         assert_eq!(history.last_managed(2), Some(b));
@@ -599,9 +641,9 @@ mod tests {
         let other = world.spawn(()).id();
         let mut history = FocusHistory::default();
 
-        history.record(1, target, None);
-        history.record(2, target, Some(&Unmanaged::Floating));
-        history.record(2, other, None);
+        history.record(1, target, None, Duration::ZERO);
+        history.record(2, target, Some(&Unmanaged::Floating), Duration::ZERO);
+        history.record(2, other, None, Duration::ZERO);
 
         history.forget(target);
 
@@ -639,11 +681,11 @@ mod tests {
         let mut history = FocusHistory::default();
         history.tiled_beside(1, window, Some(anchor));
 
-        history.record(1, window, None);
-        history.record(1, other, Some(&Unmanaged::Floating));
+        history.record(1, window, None, Duration::ZERO);
+        history.record(1, other, Some(&Unmanaged::Floating), Duration::ZERO);
         assert_eq!(return_to(&history, 1), Some(anchor));
 
-        history.record(1, other, None);
+        history.record(1, other, None, Duration::ZERO);
         assert_eq!(return_to(&history, 1), None);
     }
 
@@ -656,7 +698,10 @@ mod tests {
         let mut history = FocusHistory::default();
         history.tiled_beside(1, window, Some(anchor));
 
-        history.hand_off(1, window, |_| true, Some(successor));
+        assert_eq!(
+            history.hand_off(1, window, None, |_| true, Some(successor)),
+            Some(anchor)
+        );
 
         assert_eq!(history.last_managed(1), Some(anchor));
         assert_eq!(return_to(&history, 1), None);
@@ -668,9 +713,9 @@ mod tests {
         let window = world.spawn(()).id();
         let successor = world.spawn(()).id();
         let mut history = FocusHistory::default();
-        history.record(1, window, None);
+        history.record(1, window, None, Duration::ZERO);
 
-        history.hand_off(1, window, |_| true, Some(successor));
+        history.hand_off(1, window, None, |_| true, Some(successor));
 
         assert_eq!(history.last_managed(1), Some(successor));
     }
@@ -684,7 +729,7 @@ mod tests {
         let mut history = FocusHistory::default();
         history.tiled_beside(1, window, Some(anchor));
 
-        history.hand_off(1, window, |column| column != anchor, Some(successor));
+        history.hand_off(1, window, None, |column| column != anchor, Some(successor));
 
         assert_eq!(history.last_managed(1), Some(successor));
         assert_eq!(return_to(&history, 1), None);
@@ -699,7 +744,10 @@ mod tests {
         let mut history = FocusHistory::default();
         history.tiled_beside(1, window, Some(anchor));
 
-        history.hand_off(1, anchor, |_| true, Some(successor));
+        assert_eq!(
+            history.hand_off(1, anchor, None, |_| true, Some(successor)),
+            None
+        );
 
         assert_eq!(history.last_managed(1), Some(window));
         assert_eq!(return_to(&history, 1), None);
@@ -711,9 +759,123 @@ mod tests {
         let window = world.spawn(()).id();
         let mut history = FocusHistory::default();
 
-        history.hand_off(1, window, |_| true, Some(window));
+        history.hand_off(1, window, None, |_| true, Some(window));
 
         assert!(history.by_workspace.is_empty());
+    }
+
+    fn previous(
+        history: &FocusHistory,
+        workspace: WorkspaceId,
+    ) -> Option<(Entity, Option<Entity>)> {
+        history
+            .by_workspace
+            .get(&workspace)
+            .and_then(|slot| slot.previous)
+            .map(|previous| (previous.entity, previous.return_to))
+    }
+
+    #[test]
+    fn record_keeps_the_outgoing_window_and_its_anchor_in_previous() {
+        let mut world = World::new();
+        let window = world.spawn(()).id();
+        let anchor = world.spawn(()).id();
+        let other = world.spawn(()).id();
+        let mut history = FocusHistory::default();
+        history.tiled_beside(1, window, Some(anchor));
+
+        history.record(1, other, None, Duration::from_secs(1));
+
+        assert_eq!(previous(&history, 1), Some((window, Some(anchor))));
+        assert_eq!(return_to(&history, 1), None);
+    }
+
+    #[test]
+    fn closing_within_the_grace_returns_to_the_anchor_else_the_successor() {
+        let mut world = World::new();
+        let window = world.spawn(()).id();
+        let anchor = world.spawn(()).id();
+        let other = world.spawn(()).id();
+        let successor = world.spawn(()).id();
+        let closed_at = Some(Duration::from_millis(1500));
+
+        let mut history = FocusHistory::default();
+        history.tiled_beside(1, window, Some(anchor));
+        history.record(1, other, None, Duration::from_secs(1));
+        assert_eq!(
+            history.hand_off(1, window, closed_at, |_| true, Some(successor)),
+            Some(anchor)
+        );
+        assert_eq!(history.last_managed(1), Some(anchor));
+        assert_eq!(previous(&history, 1), None);
+
+        let mut history = FocusHistory::default();
+        history.tiled_beside(1, window, Some(anchor));
+        history.record(1, other, None, Duration::from_secs(1));
+        assert_eq!(
+            history.hand_off(
+                1,
+                window,
+                closed_at,
+                |column| column != anchor,
+                Some(successor)
+            ),
+            Some(successor)
+        );
+    }
+
+    #[test]
+    fn no_grace_once_it_expired_or_when_floating() {
+        let mut world = World::new();
+        let window = world.spawn(()).id();
+        let other = world.spawn(()).id();
+        let successor = world.spawn(()).id();
+        let mut history = FocusHistory::default();
+        history.record(1, window, None, Duration::ZERO);
+        history.record(1, other, None, Duration::from_secs(1));
+
+        let expired = Some(Duration::from_millis(1501));
+        assert_eq!(
+            history.hand_off(1, window, expired, |_| true, Some(successor)),
+            None
+        );
+        assert_eq!(
+            history.hand_off(1, window, None, |_| true, Some(successor)),
+            None
+        );
+        assert_eq!(history.last_managed(1), Some(other));
+    }
+
+    #[test]
+    fn hand_off_of_a_window_that_was_never_active_leaves_the_column() {
+        let mut world = World::new();
+        let active = world.spawn(()).id();
+        let background = world.spawn(()).id();
+        let mut history = FocusHistory::default();
+        history.record(1, active, None, Duration::ZERO);
+
+        assert_eq!(
+            history.hand_off(1, background, Some(Duration::ZERO), |_| true, Some(active)),
+            None
+        );
+        assert_eq!(history.last_managed(1), Some(active));
+    }
+
+    #[test]
+    fn forget_clears_previous() {
+        let mut world = World::new();
+        let window = world.spawn(()).id();
+        let anchor = world.spawn(()).id();
+        let other = world.spawn(()).id();
+        let mut history = FocusHistory::default();
+
+        history.tiled_beside(1, window, Some(anchor));
+        history.record(1, other, None, Duration::ZERO);
+        history.forget(anchor);
+        assert_eq!(previous(&history, 1), Some((window, None)));
+
+        history.forget(window);
+        assert_eq!(previous(&history, 1), None);
     }
 
     #[test]
@@ -740,7 +902,7 @@ mod tests {
         let entity = world.spawn(()).id();
         let mut history = FocusHistory::default();
 
-        history.record(1, entity, None);
+        history.record(1, entity, None, Duration::ZERO);
         history.forget_workspace(1);
 
         assert_eq!(history.last_managed(1), None);
