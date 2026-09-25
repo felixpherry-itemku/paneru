@@ -1229,6 +1229,7 @@ pub(super) fn apply_window_defaults(
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_window_positions(
     added: Populated<Entity, Added<Window>>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
@@ -1236,6 +1237,7 @@ pub(super) fn apply_window_positions(
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
     restoration: Option<Res<PaneruState>>,
+    mut focus_history: ResMut<FocusHistory>,
     mut ctx: WindowCtx,
 ) {
     for entity in added {
@@ -1291,20 +1293,19 @@ pub(super) fn apply_window_positions(
                 .iter_mut()
                 .find_map(|(strip, active)| active.then_some(strip))
         {
-            // Attempt inserting the window at a pre-defined position.
-            let insert_at = properties.insertion().map_or_else(
-                || {
-                    // Otherwise attempt inserting it after the current focus.
-                    let focused_window = ctx.windows.focused();
-                    // Insert to the right of the currently focused window
-                    focused_window
-                        .and_then(|(_, entity)| strip.index_of(entity).ok())
-                        .and_then(|insert_at| {
-                            (insert_at + 1 < strip.len()).then_some(insert_at + 1)
-                        })
-                },
-                Some,
-            );
+            // Attempt inserting the window at a pre-defined position, otherwise
+            // to the right of the currently focused window. niri remembers that
+            // column, so closing the new window straight away returns to it.
+            let anchor = ctx
+                .windows
+                .focused()
+                .and_then(|(_, focused)| Some((focused, strip.index_of(focused).ok()?)))
+                .filter(|_| properties.insertion().is_none());
+            let insert_at = properties.insertion().or_else(|| {
+                anchor
+                    .map(|(_, index)| index + 1)
+                    .filter(|&after| after < strip.len())
+            });
 
             debug!("New window {entity} adding at {}", *strip);
             match insert_at {
@@ -1313,6 +1314,11 @@ pub(super) fn apply_window_positions(
                     strip.insert_at(after, entity);
                 }
                 None => strip.append(entity),
+            }
+            if let Some((anchor, _)) = anchor
+                && !properties.dont_focus()
+            {
+                focus_history.tiled_beside(strip.id(), entity, Some(anchor));
             }
         }
 
