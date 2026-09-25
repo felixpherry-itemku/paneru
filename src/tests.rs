@@ -1,3 +1,4 @@
+mod close_focus;
 mod display;
 mod dynamic_workspaces;
 mod focus_or_virtual;

@@ -1086,13 +1086,13 @@ fn test_unfloat_after_virtual_switch_uses_active_workspace() {
         .run(commands);
 }
 
-fn manage() -> Event {
+pub(super) fn manage() -> Event {
     Event::Command {
         command: Command::Window(Operation::Manage),
     }
 }
 
-fn settle() -> Event {
+pub(super) fn settle() -> Event {
     Event::Command {
         command: Command::PrintState,
     }
@@ -1109,7 +1109,7 @@ fn window_size(world: &mut World, id: WinID) -> Size {
 }
 
 /// The window ids of the active row's columns, left to right.
-fn active_columns(world: &mut World) -> Vec<WinID> {
+pub(super) fn active_columns(world: &mut World) -> Vec<WinID> {
     let columns = {
         let mut query = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
         query.single(world).expect("an active strip").all_columns()
