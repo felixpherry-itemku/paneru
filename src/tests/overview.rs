@@ -1,21 +1,24 @@
 //! Tests for the overview (`src/ecs/overview.rs`).
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use bevy::ecs::entity::Entity;
-use bevy::ecs::system::SystemState;
+use bevy::ecs::system::{Res, SystemState};
 use bevy::ecs::world::World;
 use bevy::math::{IRect, IVec2};
 use objc2_core_foundation::CGPoint;
 
 use crate::assert_focused;
 use crate::commands::{Command, Direction, MoveFocus, Operation};
+use crate::config::Config;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
 use crate::ecs::overview::{
     KeyAction, Overview, OverviewConfig, OverviewLayout, OverviewPhase, OverviewRow, OverviewTile,
     key_action, project, step_progress, tile_at,
 };
-use crate::ecs::params::FrameActivity;
+use crate::ecs::params::{ActiveDisplay, FrameActivity};
+use crate::ecs::workspace::PreviousStripPosition;
 use crate::ecs::{ActiveDisplayMarker, ActiveWorkspaceMarker, SpawnWindowTrigger};
 use crate::events::Event;
 use crate::manager::Display;
@@ -715,6 +718,65 @@ fn selected(world: &World) -> Option<Entity> {
         .selected
 }
 
+/// The tiling area the overview centres its rows in.
+fn viewport(world: &mut World) -> IRect {
+    let mut state = SystemState::<(ActiveDisplay, Res<Config>)>::new(world);
+    let (display, config) = state.get(world).expect("an active display");
+    display.actual_bounds(&config)
+}
+
+/// The band of the row at `virtual_index`.
+fn band(world: &World, virtual_index: u32) -> IRect {
+    let overview = world.get_resource::<Overview>().expect("overview open");
+    overview
+        .layout
+        .rows
+        .iter()
+        .find(|row| row.virtual_index == virtual_index)
+        .expect("row projected")
+        .band
+}
+
+/// Asserts `entity`'s tile sits in the horizontal centre of its row.
+fn assert_centred(world: &World, entity: Entity) {
+    let overview = world.get_resource::<Overview>().expect("overview open");
+    let (row, tile) = overview.layout.find(entity).expect("tile");
+    let band = overview.layout.rows[row].band;
+    assert!(
+        (tile.target.center().x - band.center().x).abs() <= 1,
+        "{entity} centred: tile {:?} in band {band:?}",
+        tile.target
+    );
+}
+
+/// Asserts the row at `virtual_index` is vertically centred in the tiling area.
+fn assert_row_vertically_centred(world: &mut World, virtual_index: u32) {
+    let (band, viewport) = (band(world, virtual_index), viewport(world));
+    assert!(
+        (band.center().y - viewport.center().y).abs() <= 1,
+        "VW{virtual_index} band {band:?} centred in {viewport:?}"
+    );
+}
+
+#[test]
+fn test_overview_opens_centred_on_focus() {
+    TestHarness::new()
+        .with_windows(3)
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 0);
+            let (w0, w1) = (find_window_entity(0, world), find_window_entity(1, world));
+            assert_centred(world, w0);
+            assert_row_vertically_centred(world, 0);
+            let overview = world.get_resource::<Overview>().expect("overview open");
+            let target = |entity| overview.layout.find(entity).expect("tile").1.target;
+            assert!(
+                target(w1).min.x >= target(w0).max.x,
+                "window 1 to the right"
+            );
+        })
+        .run(vec![Event::MenuOpened { window_id: 0 }, toggle()]);
+}
+
 #[test]
 fn test_overview_swap_while_open_keeps_the_window_selected() {
     TestHarness::new()
@@ -750,6 +812,7 @@ fn test_overview_arrow_moves_real_focus_while_open() {
             assert_focused!(world, 1);
             let w1 = find_window_entity(1, world);
             assert_eq!(selected(world), Some(w1));
+            assert_centred(world, w1);
         })
         .run(vec![
             Event::MenuOpened { window_id: 0 },
@@ -760,6 +823,42 @@ fn test_overview_arrow_moves_real_focus_while_open() {
 
 /// Windows 0 and 1 go to VW1, leaving window 2 alone and focused on VW0. Down
 /// from a lone column switches the workspace behind the open overview.
+#[test]
+fn test_overview_focus_move_slides() {
+    // At speed 1.0 the ease lands within `PROGRESS_EPSILON` after about 7 s.
+    const SETTLE: Duration = Duration::from_secs(10);
+    let config = Config::try_from("[options]\n[bindings]\n[overview]\nanimation_speed = 1.0\n")
+        .expect("config parses");
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }, toggle()]);
+    harness.advance(SETTLE);
+    let w1 = find_window_entity(1, harness.world());
+    let drawn = |world: &World| {
+        let overview = world.get_resource::<Overview>().expect("overview open");
+        let (_, tile) = overview.layout.find(w1).expect("tile");
+        (
+            overview.slide,
+            tile.drawn(overview.progress, overview.slide),
+            tile.target,
+        )
+    };
+    let (slide, before, _) = drawn(harness.world());
+    assert!((slide - 1.0).abs() < f32::EPSILON, "settled after opening");
+
+    harness.run(vec![key(KEY_RIGHT)]);
+    let (slide, during, target) = drawn(harness.world());
+    assert!(slide < 1.0, "mid-slide");
+    assert!(
+        before.min.x > during.min.x && during.min.x > target.min.x,
+        "slides left: {before:?} → {during:?} → {target:?}"
+    );
+
+    harness.advance(SETTLE);
+    let (slide, after, target) = drawn(harness.world());
+    assert!((slide - 1.0).abs() < f32::EPSILON, "settled after the move");
+    assert_eq!(after, target);
+}
+
 #[test]
 fn test_overview_arrow_down_switches_workspace_while_open() {
     TestHarness::new()
@@ -786,6 +885,80 @@ fn test_overview_arrow_down_switches_workspace_while_open() {
             key(KEY_DOWN),
             key(KEY_RETURN),
         ]);
+}
+
+/// `PreviousStripPosition.focus` of the row at `virtual_index`.
+fn remembered_focus(world: &mut World, virtual_index: u32) -> Option<Entity> {
+    let mut query = world.query::<(&LayoutStrip, &PreviousStripPosition)>();
+    query
+        .iter(world)
+        .find(|(strip, _)| strip.virtual_index == virtual_index)
+        .and_then(|(_, previous)| previous.focus)
+}
+
+/// Windows 0–2 go to VW1, whose last column is focused and left behind, then
+/// VW0's last column is focused. The overview opens at command 8 and ↓ runs
+/// at command 9.
+fn remembered_row_below() -> (TestHarness, Vec<Event>) {
+    let focus_last = Event::Command {
+        command: Command::Window(Operation::Focus(Direction::Last)),
+    };
+    let switch_to = |index| Event::Command {
+        command: Command::Window(Operation::VirtualNumber(index)),
+    };
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        send_window_down(),
+        send_window_down(),
+        send_window_down(),
+        switch_to(1),
+        focus_last.clone(),
+        switch_to(0),
+        focus_last,
+        toggle(),
+        key(KEY_DOWN),
+    ];
+    (TestHarness::new().with_windows(5), commands)
+}
+
+#[test]
+fn test_overview_down_lands_on_the_tile_below_centre() {
+    let (harness, commands) = remembered_row_below();
+    harness
+        .on_iteration(8, |world, _state| {
+            let row = row_windows(world, 1);
+            let focus = remembered_focus(world, 1).expect("VW1 remembers a focus");
+            assert_eq!(row.len(), 3);
+            assert_eq!(row.last(), Some(&focus), "remembers its last column");
+            assert_centred(world, focus);
+            assert!(band(world, 1).min.y >= band(world, 0).max.y, "VW1 below");
+        })
+        .on_iteration(9, |world, _state| {
+            assert!(world.get_resource::<Overview>().is_some(), "still open");
+            assert_eq!(active_virtual_index(world), 1);
+            let focus = *row_windows(world, 1).last().expect("VW1 windows");
+            assert_eq!(selected(world), Some(focus), "↓ lands straight below");
+            assert_centred(world, focus);
+            assert_row_vertically_centred(world, 1);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_overview_left_row_stays_centred_on_its_focus() {
+    let (harness, commands) = remembered_row_below();
+    harness
+        .on_iteration(8, |world, _state| {
+            let row = row_windows(world, 0);
+            assert_eq!(row.len(), 2);
+            assert_eq!(focused_entity(world), row.last().copied(), "not the first");
+        })
+        .on_iteration(9, |world, _state| {
+            assert_eq!(active_virtual_index(world), 1);
+            let left = *row_windows(world, 0).last().expect("VW0 windows");
+            assert_centred(world, left);
+        })
+        .run(commands);
 }
 
 #[test]
@@ -907,6 +1080,7 @@ fn test_overview_closing_the_focused_window_selects_the_new_focus() {
                 .sum::<usize>();
             assert_eq!(tiles, 2, "the closed window's tile is gone");
             assert_eq!(overview.selected, focused, "the selection is the focus");
+            assert_centred(world, focused.expect("a new focus"));
         })
         .run(vec![
             Event::MenuOpened { window_id: 0 },

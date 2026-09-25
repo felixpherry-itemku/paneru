@@ -271,10 +271,11 @@ $ paneru send-cmd window virtualsendnum 3
 
 ### Overview
 
-`overview` toggles a zoomed-out map of the active display: one band per virtual
-workspace, each window drawn as a tile at its real place in the strip —
-including windows on parked workspaces and columns scrolled off screen. There is
-no default binding.
+`overview` toggles a zoomed-out view of the active display, like niri's: every
+virtual workspace is drawn at one zoom, with the focused window centred and its
+row in the middle of the screen. The other rows sit above and below it, each
+centred on the window ↑/↓ would land on, and rows or windows that don't fit run
+off the screen edges. Tiles slide as focus moves. There is no default binding.
 
 ```toml
 [bindings]
@@ -304,11 +305,11 @@ The optional `[overview]` table tunes it:
 
 ```toml
 [overview]
-animation_speed = 14.0         # zoom speed; defaults to options.animation_speed
+animation_speed = 14.0         # zoom and slide speed; defaults to options.animation_speed
 scrim_opacity = 0.3            # dims the wallpaper behind the rows (0.0 - 1.0)
 scrim_color = [0.05, 0.05, 0.07] # dim colour; the backdrop if there's no wallpaper
-row_gap = 24                   # points between workspace bands
-label_height = 20              # points reserved for each band's number
+zoom = 0.5                     # size of each workspace row relative to the screen (0.1 - 0.75)
+row_gap = 24                   # points between workspace rows
 thumbnails = true              # capture window thumbnails (see below)
 ```
 
