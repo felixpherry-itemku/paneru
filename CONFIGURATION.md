@@ -320,8 +320,9 @@ thumbnails = true              # live window content in tiles (see below)
 **Thumbnails** show each window's live content: only tiles on screen stream, at
 up to 30 frames per second, and only while the overview is open. Each window's
 last frame is kept, so the next open shows content at once. While streams run
-macOS shows its screen-recording indicator in the menu bar; the overview covers
-it, and it lingers a few seconds after close.
+macOS shows its screen-recording indicator: the overview covers the menu bar
+icon, but the purple dot in the top-right corner stays visible, and both linger
+a few seconds after close.
 
 They need macOS 14 or later and the **Screen Recording** permission
 (System Settings → Privacy & Security → Screen & System Audio Recording). This
