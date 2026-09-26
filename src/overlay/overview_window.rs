@@ -2,7 +2,7 @@
 //! ECS each frame, and the [`OverviewRenderer`] that shows it as a Core
 //! Animation layer tree in a borderless window above every application.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 #[cfg(feature = "thumbnails")]
 use std::sync::Arc;
 
@@ -84,27 +84,29 @@ fn srgb(rgb: [f64; 3], alpha: f64) -> CFRetained<CGColor> {
 
 /// The streams to start and to stop: a tile streams while its settled frame is
 /// on `display`. Judged on `target` rather than the drawn frame, which moves
-/// every frame of the zoom and of a slide.
+/// every frame of the zoom and of a slide. `running` maps each stream to the
+/// `target` size it was started at; a tile resized since is in both lists, so
+/// it restarts at its new size.
 #[cfg_attr(not(feature = "thumbnails"), allow(dead_code))]
 fn stream_changes(
-    running: &HashSet<WinID>,
+    running: &HashMap<WinID, IVec2>,
     tiles: &[SceneTile],
     display: IRect,
 ) -> (Vec<WinID>, Vec<WinID>) {
     let wanted = tiles
         .iter()
         .filter(|tile| tile.window_id != 0 && !tile.target.intersect(display).is_empty())
-        .map(|tile| tile.window_id)
+        .map(|tile| (tile.window_id, tile.target.size()))
         .collect::<Vec<_>>();
     let start = wanted
         .iter()
-        .copied()
-        .filter(|id| !running.contains(id))
+        .filter(|(id, size)| running.get(id) != Some(size))
+        .map(|(id, _)| *id)
         .collect();
     let mut stop = running
         .iter()
-        .copied()
-        .filter(|id| !wanted.contains(id))
+        .filter(|&(&id, &size)| !wanted.contains(&(id, size)))
+        .map(|(id, _)| *id)
         .collect::<Vec<_>>();
     stop.sort_unstable();
     (start, stop)
@@ -372,9 +374,10 @@ pub struct OverviewRenderer {
     /// the last frame after its stream stops, so the next open shows it at
     /// once. Pruned to the projected windows on each open.
     tiles: HashMap<WinID, TileLayers>,
-    /// A live stream per tile whose settled frame is on the display.
+    /// A live stream per tile whose settled frame is on the display, with the
+    /// `target` size it was started at.
     #[cfg(feature = "thumbnails")]
-    streams: HashMap<WinID, LiveStream>,
+    streams: HashMap<WinID, (IVec2, LiveStream)>,
 }
 
 impl OverviewRenderer {
@@ -502,31 +505,44 @@ impl OverviewRenderer {
         }
         // From the first frame of the open, so content can arrive mid-zoom.
         #[cfg(feature = "thumbnails")]
-        if scene.thumbnails {
-            let running = self.streams.keys().copied().collect();
-            let (start, stop) = stream_changes(&running, &scene.tiles, scene.display);
-            for id in stop {
-                self.streams.remove(&id);
-            }
-            // ponytail: sized once at start; a window resized while open keeps
-            // its stream size and `kCAGravityResize` scales it. Reconfigure
-            // with `updateConfiguration` if that looks soft.
-            let requests = scene
-                .tiles
-                .iter()
-                .filter(|tile| start.contains(&tile.window_id))
-                .filter_map(|tile| {
-                    let sink = self.tiles.get(&tile.window_id)?.sink(mtm);
-                    let (width, height) = (tile.target.width(), tile.target.height());
-                    Some((tile.window_id, pixels(width), pixels(height), sink))
-                })
-                .collect();
-            self.streams.extend(capture::start_streams(requests));
-        } else {
-            self.streams.clear();
-        }
+        self.update_streams(&scene, pixels);
 
         self.scene = Some(scene);
+    }
+
+    /// Starts and stops streams to match `scene`: none when thumbnails are off.
+    #[cfg(feature = "thumbnails")]
+    fn update_streams(&mut self, scene: &OverviewScene, pixels: impl Fn(i32) -> u32) {
+        if !scene.thumbnails {
+            self.streams.clear();
+            return;
+        }
+        let running = self
+            .streams
+            .iter()
+            .map(|(&id, &(size, _))| (id, size))
+            .collect();
+        let (start, stop) = stream_changes(&running, &scene.tiles, scene.display);
+        for id in stop {
+            self.streams.remove(&id);
+        }
+        // A resized tile restarts; its last frame stretches until the new
+        // stream's first one.
+        let requests = scene
+            .tiles
+            .iter()
+            .filter(|tile| start.contains(&tile.window_id))
+            .filter_map(|tile| {
+                let sink = self.tiles.get(&tile.window_id)?.sink(self.mtm);
+                let (width, height) = (tile.target.width(), tile.target.height());
+                Some((tile.window_id, pixels(width), pixels(height), sink))
+            })
+            .collect();
+        for (id, stream) in capture::start_streams(requests) {
+            if let Some(tile) = scene.tiles.iter().find(|tile| tile.window_id == id) {
+                self.streams.insert(id, (tile.target.size(), stream));
+            }
+        }
     }
 
     /// Caches a captured desktop picture, and shows it if this open is
@@ -578,6 +594,8 @@ mod tests {
         min: IVec2::new(0, 0),
         max: IVec2::new(1000, 800),
     };
+    /// The size of every test tile below.
+    const SIZE: IVec2 = IVec2::new(300, 200);
 
     fn tile(window_id: WinID, target: IRect) -> SceneTile {
         SceneTile {
@@ -600,14 +618,14 @@ mod tests {
             // Touching the edge only: nothing of it is on screen.
             tile(4, IRect::new(1000, 100, 1300, 300)),
         ];
-        let (start, stop) = stream_changes(&HashSet::new(), &tiles, DISPLAY);
+        let (start, stop) = stream_changes(&HashMap::new(), &tiles, DISPLAY);
         assert_eq!(start, vec![1, 2]);
         assert!(stop.is_empty());
     }
 
     #[test]
     fn test_stream_changes_after_a_slide_starts_the_new_and_stops_the_gone() {
-        let running = HashSet::from([1, 2, 3]);
+        let running = HashMap::from([(1, SIZE), (2, SIZE), (3, SIZE)]);
         let tiles = [
             tile(1, IRect::new(-500, 100, -200, 300)),
             tile(2, IRect::new(0, 100, 300, 300)),
@@ -621,7 +639,7 @@ mod tests {
 
     #[test]
     fn test_stream_changes_is_empty_when_running_matches_and_skips_no_window() {
-        let running = HashSet::from([1, 2]);
+        let running = HashMap::from([(1, SIZE), (2, SIZE)]);
         let tiles = [
             tile(1, IRect::new(0, 100, 300, 300)),
             tile(2, IRect::new(350, 100, 650, 300)),
@@ -630,6 +648,19 @@ mod tests {
         let (start, stop) = stream_changes(&running, &tiles, DISPLAY);
         assert!(start.is_empty(), "{start:?}");
         assert!(stop.is_empty(), "{stop:?}");
+    }
+
+    #[test]
+    fn test_stream_changes_restarts_a_resized_tile() {
+        let running = HashMap::from([(1, SIZE), (2, SIZE)]);
+        let tiles = [
+            tile(1, IRect::new(0, 100, 300, 300)),
+            // Made wider while the overview was open.
+            tile(2, IRect::new(350, 100, 950, 300)),
+        ];
+        let (start, stop) = stream_changes(&running, &tiles, DISPLAY);
+        assert_eq!(start, vec![2]);
+        assert_eq!(stop, vec![2]);
     }
 
     #[test]

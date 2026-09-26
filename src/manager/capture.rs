@@ -335,7 +335,9 @@ fn capture(
     }
 }
 
-/// One window at `width` x `height` pixels, without cursor or shadow.
+/// One window at `width` x `height` pixels, without cursor or shadow. A window
+/// whose shape no longer matches (resized after its stream started) is
+/// stretched to fill, not padded with black.
 fn configuration(width: u32, height: u32) -> Retained<SCStreamConfiguration> {
     let config = unsafe { SCStreamConfiguration::new() };
     unsafe {
@@ -343,6 +345,7 @@ fn configuration(width: u32, height: u32) -> Retained<SCStreamConfiguration> {
         config.setHeight(height as usize);
         config.setShowsCursor(false);
         config.setScalesToFit(true);
+        config.setPreservesAspectRatio(false);
         config.setIgnoreShadowsSingleWindow(true);
     }
     config
