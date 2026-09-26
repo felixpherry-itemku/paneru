@@ -110,6 +110,11 @@ fn stream_changes(
     (start, stop)
 }
 
+/// Drops cached tile layers for windows the new open no longer projects.
+fn prune<T>(cache: &mut HashMap<WinID, T>, tiles: &[SceneTile]) {
+    cache.retain(|id, _| tiles.iter().any(|tile| tile.window_id == *id));
+}
+
 /// Runs `changes` with Core Animation's implicit animations off. Otherwise
 /// every frame, contents and opacity change gets its own 0.25 s tween,
 /// fighting the zoom's ease-out.
@@ -137,8 +142,7 @@ struct TileLayers {
 }
 
 impl TileLayers {
-    /// `scale` is the display's backing scale, for crisp icon and text.
-    fn new(pid: Pid, scale: CGFloat) -> Self {
+    fn new(pid: Pid) -> Self {
         let card = CALayer::new();
         card.setBackgroundColor(Some(&srgb(TILE_FILL, 0.92)));
         card.setMasksToBounds(true);
@@ -149,7 +153,6 @@ impl TileLayers {
 
         let icon = CALayer::new();
         icon.setContentsGravity(unsafe { kCAGravityResizeAspect });
-        icon.setContentsScale(scale);
         if let Some(image) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
             .and_then(|app| app.icon())
         {
@@ -166,7 +169,6 @@ impl TileLayers {
         title.setForegroundColor(Some(&srgb(WHITE, 0.9)));
         title.setAlignmentMode(unsafe { kCAAlignmentCenter });
         title.setTruncationMode(unsafe { kCATruncationEnd });
-        title.setContentsScale(scale);
 
         card.addSublayer(&content);
         card.addSublayer(&icon);
@@ -177,6 +179,14 @@ impl TileLayers {
             icon,
             title,
         }
+    }
+
+    /// Adds the card to `host`. `scale` is the display's backing scale, for
+    /// crisp icon and text: a cached tile may come back on another display.
+    fn attach(&self, host: &CALayer, scale: CGFloat) {
+        self.icon.setContentsScale(scale);
+        self.title.setContentsScale(scale);
+        host.addSublayer(&self.card);
     }
 
     /// Places the card at `tile`'s drawn frame and lays out what's in it.
@@ -358,7 +368,9 @@ pub struct OverviewRenderer {
     /// The display whose captured picture this open shows, so a capture
     /// arriving for it replaces the backdrop.
     awaiting: Option<CGDirectDisplayID>,
-    /// Each projected window's layers, created on its first frame.
+    /// Each window's layers, kept for the renderer's lifetime: `content` keeps
+    /// the last frame after its stream stops, so the next open shows it at
+    /// once. Pruned to the projected windows on each open.
     tiles: HashMap<WinID, TileLayers>,
     /// A live stream per tile whose settled frame is on the display.
     #[cfg(feature = "thumbnails")]
@@ -441,28 +453,37 @@ impl OverviewRenderer {
             let scrim = srgb(scene.scrim_color, f64::from(scene.scrim_opacity));
             stage.scrim.setBackgroundColor(Some(&scrim));
 
+            // Detached, not dropped: a window closed mid-open, or one this
+            // open doesn't project. First, so a pruned card never stays up.
+            for (id, layers) in &self.tiles {
+                if !scene.tiles.iter().any(|tile| tile.window_id == *id) {
+                    layers.card.removeFromSuperlayer();
+                }
+            }
+            if first {
+                prune(&mut self.tiles, &scene.tiles);
+            }
             // Later tiles on top.
             for (tile, z) in scene.tiles.iter().zip(0_u32..) {
                 // No window behind it: nothing to key its layers by.
                 if tile.window_id == 0 {
                     continue;
                 }
-                let layers = self.tiles.entry(tile.window_id).or_insert_with(|| {
-                    let layers = TileLayers::new(tile.pid, scale);
-                    stage.host.addSublayer(&layers.card);
-                    layers
-                });
+                let layers = self
+                    .tiles
+                    .entry(tile.window_id)
+                    .or_insert_with(|| TileLayers::new(tile.pid));
+                // New, or cached from an earlier open and so off this `host`.
+                if layers.card.superlayer().is_none() {
+                    layers.attach(&stage.host, scale);
+                }
                 layers.card.setZPosition(f64::from(z));
+                // A frame cached while thumbnails were on.
+                if !scene.thumbnails {
+                    layers.content.setHidden(true);
+                }
                 layers.layout(tile, scene.display.min);
             }
-            // A window closed while the overview is open.
-            self.tiles.retain(|id, layers| {
-                let projected = scene.tiles.iter().any(|tile| tile.window_id == *id);
-                if !projected {
-                    layers.card.removeFromSuperlayer();
-                }
-                projected
-            });
         });
 
         #[cfg(feature = "thumbnails")]
@@ -529,16 +550,21 @@ impl OverviewRenderer {
         }
     }
 
-    /// Takes the window down and forgets everything drawn in it.
+    /// Takes the window down. Tile layers stay, with their last frames, for
+    /// the next open.
     pub fn close(&mut self) {
         // Nothing records while the overview is closed.
         #[cfg(feature = "thumbnails")]
         self.streams.clear();
         set_overview_window(0);
+        without_animation(|| {
+            for layers in self.tiles.values() {
+                layers.card.removeFromSuperlayer();
+            }
+        });
         if let Some(stage) = self.window.take() {
             stage.window.orderOut(None::<&AnyObject>);
         }
-        self.tiles.clear();
         self.scene = None;
         self.awaiting = None;
     }
@@ -604,5 +630,13 @@ mod tests {
         let (start, stop) = stream_changes(&running, &tiles, DISPLAY);
         assert!(start.is_empty(), "{start:?}");
         assert!(stop.is_empty(), "{stop:?}");
+    }
+
+    #[test]
+    fn test_prune_keeps_only_projected_windows() {
+        let mut cache = HashMap::from([(1, "a"), (2, "b"), (3, "c")]);
+        let tiles = [tile(2, DISPLAY), tile(4, DISPLAY)];
+        prune(&mut cache, &tiles);
+        assert_eq!(cache.into_keys().collect::<Vec<_>>(), vec![2]);
     }
 }
