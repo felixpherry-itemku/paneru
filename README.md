@@ -79,8 +79,8 @@ inspired by [Niri] and [PaperWM.spoon].
   should be enabled - this allows Paneru to manage the workspaces independently.
 
 - Optionally, grant Screen Recording permission ("Privacy & Security -> Screen &
-  System Audio Recording") to see window thumbnails in the overview (macOS 14+).
-  Without it the overview shows app icons and titles instead.
+  System Audio Recording") to see live window previews in the overview
+  (macOS 14+). Without it the overview shows app icons and titles instead.
 
 - **Multiple displays**. Paneru is moving the windows off-screen, hiding them
   to the left or right. If you have multiple displays, for example your laptop

@@ -314,10 +314,16 @@ scrim_opacity = 0.3            # dims the wallpaper behind the rows (0.0 - 1.0)
 scrim_color = [0.05, 0.05, 0.07] # dim colour; the backdrop if there's no wallpaper
 zoom = 0.5                     # size of each workspace row relative to the screen (0.1 - 0.75)
 row_gap = 24                   # points between workspace rows
-thumbnails = true              # capture window thumbnails (see below)
+thumbnails = true              # live window content in tiles (see below)
 ```
 
-**Thumbnails** need macOS 14 or later and the **Screen Recording** permission
+**Thumbnails** show each window's live content: only tiles on screen stream, at
+up to 30 frames per second, and only while the overview is open. Each window's
+last frame is kept, so the next open shows content at once. While streams run
+macOS shows its screen-recording indicator in the menu bar; the overview covers
+it, and it lingers a few seconds after close.
+
+They need macOS 14 or later and the **Screen Recording** permission
 (System Settings → Privacy & Security → Screen & System Audio Recording). This
 is the only feature in Paneru that needs more than Accessibility. Without it —
 or with `thumbnails = false` — tiles show the app icon and window title instead,
