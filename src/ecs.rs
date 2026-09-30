@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
-use bevy::app::{First, Last, PostUpdate, PreUpdate, Startup};
+use bevy::app::{AppExit, First, Last, PostUpdate, PreUpdate, Startup};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::query::{Added, Changed, With};
@@ -22,6 +22,7 @@ use bevy::{
     ecs::{component::Component, entity::Entity, schedule::IntoScheduleConfigs},
 };
 use derive_more::{Deref, DerefMut};
+use objc2::rc::autoreleasepool;
 use tracing::{Level, error, instrument, warn};
 
 use crate::commands::register_commands;
@@ -636,6 +637,22 @@ pub(crate) fn rewatch_configs(
     Some(watcher)
 }
 
+/// Replaces `ScheduleRunnerPlugin`'s loop to give every frame its own
+/// autorelease pool. Without one, whatever `AppKit` autoreleases inside a system
+/// — the window `orderFront`/`orderOut` retain, for one — sat in the main
+/// thread's never-drained top-level pool: each overview open leaked its
+/// full-screen window and every layer under it.
+fn run_frames(mut app: BevyApp) -> AppExit {
+    app.finish();
+    app.cleanup();
+    loop {
+        autoreleasepool(|_| app.update());
+        if let Some(exit) = app.should_exit() {
+            return exit;
+        }
+    }
+}
+
 pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<BevyApp> {
     crate::manager::app::bound_ax_messaging_timeout()?;
 
@@ -675,6 +692,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     let mut app = BevyApp::new();
 
     app.add_plugins(MinimalPlugins)
+        .set_runner(run_frames)
         // `add_message`, not `init_resource`: the latter never registers the
         // buffer with bevy's `MessageRegistry`, so it's never double-buffered
         // and grows unbounded instead — every event lived for the process's
