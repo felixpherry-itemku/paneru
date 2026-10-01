@@ -1022,16 +1022,24 @@ pub(super) fn update_overlays(
         return;
     }
 
+    // Closing the last window leaves nothing focused; hide the stale outline.
     let Some((window, entity)) = windows.focused() else {
+        overlay_mgr.hide_all();
         return;
     };
     let focused_window_id = window.id();
+    // Virtual workspaces share one macOS space, so the space lookup only applies
+    // to floating windows; a tiled window from a sibling strip must not match.
+    let floating = matches!(
+        windows.get_managed(entity),
+        Some((_, _, Some(Unmanaged::Floating)))
+    );
     let show_overlay = !window.is_full_screen()
         && (active_strip.contains(entity)
-            // if the window is floating, check whether it's present in the workspace.
-            || window_manager
-                .windows_in_workspace(active_strip.id())
-                .is_ok_and(|ids| ids.contains(&focused_window_id)));
+            || floating
+                && window_manager
+                    .windows_in_workspace(active_strip.id())
+                    .is_ok_and(|ids| ids.contains(&focused_window_id)));
 
     if !show_overlay {
         // No managed window on the active workspace has focus — hide the overlay rather than
